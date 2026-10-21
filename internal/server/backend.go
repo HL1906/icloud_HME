@@ -77,6 +77,18 @@ type ForwardResult struct {
 	Method    string           `json:"method"`
 }
 
+// AliasActivityScan 是对某账号收件箱的一次扫描结果。
+//
+// Hits 的键是别名邮箱(小写),值是最近一次收到投递的时间。
+// 别名最终都转发到同一个 iCloud 收件箱,所以扫一遍 INBOX 就能覆盖全部别名。
+type AliasActivityScan struct {
+	AccountID  string
+	Method     string
+	Scanned    int
+	WindowDays int
+	Hits       map[string]time.Time
+}
+
 // Backend 是可替换的业务接口;handler 只依赖本接口,测试使用内存 fake。
 type Backend interface {
 	ListAccounts() []account.Summary
@@ -92,6 +104,8 @@ type Backend interface {
 	ListAliases(string) ([]hme.Alias, error)
 	SetAliasActive(string, string, bool) (bool, error)
 	DeleteAlias(string, string) error
+	// ScanAliasActivity 扫描收件箱,统计每个别名最近一次收信时间。
+	ScanAliasActivity(string, int, int) (AliasActivityScan, error)
 	ListInbox(InboxQuery) (InboxResult, error)
 	GetMessage(string, string) (*mail.FullMessage, error)
 	DeleteMessage(string, string) error
@@ -333,6 +347,88 @@ func (b *managerBackend) DeleteAlias(accountID, anonymousID string) error {
 		return classifyUpstreamErr("删除失败", err)
 	}
 	return nil
+}
+
+// ScanAliasActivity 扫描账号收件箱,统计每个别名最近一次收到邮件的时间。
+//
+// 所有隐藏邮箱都转发到同一个 iCloud 收件箱,因此不必按别名逐个搜索:
+// 取最近 limit 封邮件的信封,用 To 头匹配别名列表,每个别名取最大日期即可。
+// 只取信封不下载正文,几百封也只有几十 KB。
+//
+// 没有任何别名收到过邮件不算错误——"从未收信"本身就是有用的信息,
+// 由调用方根据 Hits 里缺失的邮箱判断。
+func (b *managerBackend) ScanAliasActivity(accountID string, days, limit int) (AliasActivityScan, error) {
+	aliases, err := b.cachedAliases(accountID)
+	if err != nil {
+		return AliasActivityScan{}, err
+	}
+	owners := make(map[string]struct{}, len(aliases))
+	for _, a := range aliases {
+		if key := strings.ToLower(strings.TrimSpace(a.Email)); key != "" {
+			owners[key] = struct{}{}
+		}
+	}
+	hits := make(map[string]time.Time)
+	result := AliasActivityScan{AccountID: accountID, WindowDays: days, Hits: hits}
+
+	// 演示模式的别名是内存里造的,真实收件箱里当然没有它们
+	if b.demo != nil {
+		result.Method = "demo"
+		result.Scanned = len(aliases)
+		result.Hits = b.demo.activity(owners, days)
+		return result, nil
+	}
+
+	record := func(list []mail.DeliveryHit) {
+		result.Scanned = len(list)
+		for _, item := range list {
+			if item.Date.IsZero() {
+				continue
+			}
+			for _, addr := range item.Addresses {
+				key := strings.ToLower(strings.TrimSpace(addr))
+				if _, ok := owners[key]; !ok {
+					continue
+				}
+				if prev, ok := hits[key]; !ok || item.Date.After(prev) {
+					hits[key] = item.Date
+				}
+			}
+		}
+	}
+
+	poolErr := b.mgr.WithMailClient(accountID, func(mc *mail.Client) error {
+		list, scanErr := mc.ScanRecipients(limit, days)
+		if scanErr != nil {
+			return scanErr
+		}
+		result.Method = "imap"
+		record(list)
+		return nil
+	})
+	if poolErr == nil {
+		return result, nil
+	}
+
+	// IMAP 不可用(只配了 Cookie 的账号)时退回 Web API
+	wmc, werr := b.mgr.WebMailClient(accountID)
+	if werr != nil {
+		return AliasActivityScan{}, &BackendError{Status: http.StatusBadRequest, Code: "VALIDATION_ERROR", Message: "无可用邮件客户端: 需要 App Password 或 Cookie"}
+	}
+	messages, werr := wmc.ListInbox(limit)
+	if werr != nil {
+		return AliasActivityScan{}, &BackendError{Status: http.StatusBadGateway, Code: "UPSTREAM_FAILURE", Message: "读取邮件失败"}
+	}
+	result.Method = "web_api"
+	list := make([]mail.DeliveryHit, 0, len(messages))
+	for _, m := range messages {
+		list = append(list, mail.DeliveryHit{
+			Addresses: mail.SplitAddresses(m.To),
+			Date:      mail.ParseMessageDate(m.Date),
+		})
+	}
+	record(list)
+	return result, nil
 }
 
 // ListInbox 读取收件箱摘要:IMAP (App Password) 优先,Web API (Cookie) 回退。

@@ -23,6 +23,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -59,6 +60,9 @@ type Server struct {
 	pool *pool.Pool
 	// meta 保存本地分组与别名备注(系统自有数据,不同步 iCloud)
 	meta *aliasmeta.Store
+	// scanMu/scanning 防止同一账号并发扫描收件箱(纯浪费上游连接)
+	scanMu   sync.Mutex
+	scanning map[string]bool
 }
 
 // New 创建 Server。mgr 为账号管理器,cfg 为安全配置。
@@ -92,9 +96,10 @@ func newWithBackend(be Backend, cfg Config) (*Server, error) {
 		gin.SetMode(gin.ReleaseMode)
 	}
 	s := &Server{
-		be:      be,
-		limiter: auth.NewLimiter(nil, 15*time.Minute, 5, 10000).WithGlobalLimit(300),
-		cfg:     cfg,
+		be:       be,
+		limiter:  auth.NewLimiter(nil, 15*time.Minute, 5, 10000).WithGlobalLimit(300),
+		cfg:      cfg,
+		scanning: make(map[string]bool),
 	}
 	authMgr, err := auth.NewManager(auth.Options{
 		Password:       cfg.AdminPassword,
@@ -273,6 +278,10 @@ func (s *Server) register() {
 			authed.GET("/alias-meta", s.listAliasMetaHandler)
 			authed.PUT("/alias-meta", csrfCheck(s.auth), s.putAliasMetaHandler)
 			authed.DELETE("/alias-meta", csrfCheck(s.auth), s.deleteAliasMetaHandler)
+
+			// ===== 收信活动(最近一次收到邮件的时间) =====
+			authed.GET("/alias-activity", s.aliasActivityHandler)
+			authed.POST("/alias-activity/scan", csrfCheck(s.auth), s.scanAliasActivityHandler)
 
 			// ===== 别名池自动补号 =====
 			authed.GET("/pool", s.listPoolHandler)

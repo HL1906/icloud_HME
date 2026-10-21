@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func newTempStore(t *testing.T) (*Store, string) {
@@ -329,3 +330,119 @@ func TestMemoryOnlyWithoutDataDir(t *testing.T) {
 }
 
 func ptr(s string) *string { return &s }
+
+func TestApplyActivityTracksNewestHit(t *testing.T) {
+	store, dir := newTempStore(t)
+	now := time.Date(2026, 10, 21, 18, 0, 0, 0, time.UTC)
+	store.now = func() time.Time { return now }
+
+	newer := now.Add(-24 * time.Hour)
+	older := now.Add(-240 * time.Hour)
+	hits := map[string]time.Time{
+		"Alpha@iCloud.com": newer, // 大小写无关
+		"beta@icloud.com":  older,
+	}
+	updated, err := store.ApplyActivity("acc_1", hits, 120, 90, now)
+	if err != nil {
+		t.Fatalf("ApplyActivity: %v", err)
+	}
+	if updated != 2 {
+		t.Fatalf("应记录 2 条, got %d", updated)
+	}
+
+	entry, ok := store.Get("alpha@icloud.com")
+	if !ok || entry.LastReceivedAt != newer.Format(time.RFC3339) {
+		t.Fatalf("应收录最近收信时间, got %+v (ok=%v)", entry, ok)
+	}
+	if entry.AccountID != "acc_1" {
+		t.Fatalf("新建记录应带上账号, got %q", entry.AccountID)
+	}
+
+	// 第二次扫描拿到更早的时间:不能把已有的记录改小
+	updated, err = store.ApplyActivity("acc_1", map[string]time.Time{
+		"alpha@icloud.com": now.Add(-1000 * time.Hour),
+	}, 80, 90, now.Add(time.Hour))
+	if err != nil {
+		t.Fatalf("ApplyActivity 第二次: %v", err)
+	}
+	if updated != 0 {
+		t.Fatalf("旧时间不应覆盖新时间, got updated=%d", updated)
+	}
+	entry, _ = store.Get("alpha@icloud.com")
+	if entry.LastReceivedAt != newer.Format(time.RFC3339) {
+		t.Fatalf("时间被改小: %q", entry.LastReceivedAt)
+	}
+
+	// 账号级摘要保留最近一次扫描
+	act, ok := store.GetActivity("acc_1")
+	if !ok {
+		t.Fatal("应记录账号扫描摘要")
+	}
+	if act.Scanned != 80 || act.Matched != 1 || act.WindowDays != 90 {
+		t.Fatalf("扫描摘要不符: %+v", act)
+	}
+
+	// 重启后仍然存在
+	reloaded, err := NewStore(dir)
+	if err != nil {
+		t.Fatalf("重新加载: %v", err)
+	}
+	entry, ok = reloaded.Get("alpha@icloud.com")
+	if !ok || entry.LastReceivedAt != newer.Format(time.RFC3339) {
+		t.Fatalf("收信时间未持久化: %+v (ok=%v)", entry, ok)
+	}
+	if _, ok := reloaded.GetActivity("acc_1"); !ok {
+		t.Fatal("扫描摘要未持久化")
+	}
+}
+
+func TestActivitySurvivesGroupEdits(t *testing.T) {
+	store, _ := newTempStore(t)
+	now := time.Date(2026, 10, 21, 18, 0, 0, 0, time.UTC)
+	store.now = func() time.Time { return now }
+	hit := now.Add(-48 * time.Hour)
+
+	if _, err := store.ApplyActivity("acc_1", map[string]time.Time{"a@icloud.com": hit}, 10, 90, now); err != nil {
+		t.Fatalf("ApplyActivity: %v", err)
+	}
+
+	// 1) 设分组再清空:收信时间都不能丢
+	group, err := store.CreateGroup("购物", "", "")
+	if err != nil {
+		t.Fatalf("CreateGroup: %v", err)
+	}
+	if _, err := store.Upsert("a@icloud.com", "acc_1", group.ID, ""); err != nil {
+		t.Fatalf("Upsert: %v", err)
+	}
+	entry, _ := store.Get("a@icloud.com")
+	if entry.LastReceivedAt == "" {
+		t.Fatal("归组后收信时间丢失")
+	}
+
+	if _, err := store.Upsert("a@icloud.com", "acc_1", "", ""); err != nil {
+		t.Fatalf("Upsert 清空: %v", err)
+	}
+	entry, ok := store.Get("a@icloud.com")
+	if !ok {
+		t.Fatal("清空分组后不该整条删除:还有收信记录")
+	}
+	if entry.GroupID != "" || entry.LastReceivedAt == "" {
+		t.Fatalf("只应清空分组, got %+v", entry)
+	}
+
+	// 2) 批量移出分组同样保留
+	if _, err := store.AssignGroupBulk([]string{"a@icloud.com"}, "acc_1", ""); err != nil {
+		t.Fatalf("AssignGroupBulk: %v", err)
+	}
+	if entry, ok := store.Get("a@icloud.com"); !ok || entry.LastReceivedAt == "" {
+		t.Fatalf("批量移出分组后收信时间丢失: %+v (ok=%v)", entry, ok)
+	}
+
+	// 3) 删除分组也不该删掉这条
+	if _, err := store.DeleteGroup(group.ID); err != nil {
+		t.Fatalf("DeleteGroup: %v", err)
+	}
+	if entry, ok := store.Get("a@icloud.com"); !ok || entry.LastReceivedAt == "" {
+		t.Fatalf("删分组后收信时间丢失: %+v (ok=%v)", entry, ok)
+	}
+}

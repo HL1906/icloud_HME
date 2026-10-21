@@ -63,6 +63,13 @@ type fakeBackend struct {
 	ackedIDs       []string
 	ackedForwarded bool
 	ackErr         error
+
+	// 收信活动扫描
+	activity      AliasActivityScan
+	activityErr   error
+	activityDays  int
+	activityLimit int
+	activityCalls int
 }
 
 func (f *fakeBackend) ListAccounts() []account.Summary { return f.accounts }
@@ -153,6 +160,27 @@ func (f *fakeBackend) DeleteAlias(accountID, anonymousID string) error {
 		return err
 	}
 	return f.aliasDeleteErr
+}
+
+// ScanAliasActivity 返回预置的扫描结果,并记录调用参数。
+func (f *fakeBackend) ScanAliasActivity(accountID string, days, limit int) (AliasActivityScan, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.activityCalls++
+	f.activityDays, f.activityLimit = days, limit
+	if f.activityErr != nil {
+		return AliasActivityScan{}, f.activityErr
+	}
+	out := f.activity
+	out.AccountID = accountID
+	out.WindowDays = days
+	if out.Method == "" {
+		out.Method = "imap"
+	}
+	if out.Hits == nil {
+		out.Hits = map[string]time.Time{}
+	}
+	return out, nil
 }
 
 func (f *fakeBackend) ListInbox(q InboxQuery) (InboxResult, error) {

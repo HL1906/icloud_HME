@@ -234,6 +234,158 @@ func (c *Client) ListInbox(limit int, days int) ([]Message, error) {
 	return out, nil
 }
 
+// DeliveryHit 是一封邮件的投递信息(只取信封,不下载正文)。
+type DeliveryHit struct {
+	Addresses []string
+	Date      time.Time
+}
+
+// maxScanLimit 是一次收信扫描最多拉取的信封数量,防止误传超大值把连接拖住。
+const maxScanLimit = 2000
+
+// ScanRecipients 拉取收件箱最近 limit 封邮件的收件地址与时间(新→旧)。
+//
+// 与 ListInbox 的区别:只取信封(FetchEnvelope),不下载任何正文,
+// 几百封也只有几十 KB,适合统计"每个别名最近一次收信时间"。
+// days 只保留近 N 天的邮件(0 表示不限制)。
+func (c *Client) ScanRecipients(limit, days int) ([]DeliveryHit, error) {
+	if c.cli == nil {
+		return nil, fmt.Errorf("未连接")
+	}
+	if limit <= 0 {
+		limit = 500
+	}
+	if limit > maxScanLimit {
+		limit = maxScanLimit
+	}
+	if _, err := c.cli.Select("INBOX", true); err != nil {
+		return nil, err
+	}
+
+	criteria := imap.NewSearchCriteria()
+	if days > 0 {
+		criteria.Since = time.Now().AddDate(0, 0, -days)
+	}
+	uids, err := c.cli.UidSearch(criteria)
+	if err != nil {
+		// 有些服务器对 SINCE 搜索支持不佳,退化为按序号取最近 limit 封
+		return c.scanRecentBySeq(limit, days)
+	}
+	if len(uids) == 0 {
+		return []DeliveryHit{}, nil
+	}
+	uids = newestUIDs(uids, limit)
+
+	seqset := new(imap.SeqSet)
+	seqset.AddNum(uids...)
+	return c.fetchEnvelopes(seqset, true, days)
+}
+
+// scanRecentBySeq 不做服务端搜索,直接按序号拉最近 limit 封信封。
+func (c *Client) scanRecentBySeq(limit, days int) ([]DeliveryHit, error) {
+	mbox, err := c.cli.Select("INBOX", true)
+	if err != nil {
+		return nil, err
+	}
+	total := int(mbox.Messages)
+	if total == 0 {
+		return []DeliveryHit{}, nil
+	}
+	from := 1
+	if total > limit {
+		from = total - limit + 1
+	}
+	seqset := new(imap.SeqSet)
+	seqset.AddRange(uint32(from), uint32(total))
+	return c.fetchEnvelopes(seqset, false, days)
+}
+
+// fetchEnvelopes 抓取一批邮件的信封并转换为投递信息。byUID 决定用 UID 还是序号。
+func (c *Client) fetchEnvelopes(seqset *imap.SeqSet, byUID bool, days int) ([]DeliveryHit, error) {
+	items := []imap.FetchItem{imap.FetchUid, imap.FetchEnvelope, imap.FetchInternalDate}
+	messages := make(chan *imap.Message, 256)
+	done := make(chan error, 1)
+	go func() {
+		if byUID {
+			done <- c.cli.UidFetch(seqset, items, messages)
+			return
+		}
+		done <- c.cli.Fetch(seqset, items, messages)
+	}()
+
+	out := make([]DeliveryHit, 0, 64)
+	for msg := range messages {
+		if msg == nil || msg.Envelope == nil {
+			continue
+		}
+		date := msg.Envelope.Date
+		if date.IsZero() {
+			date = msg.InternalDate
+		}
+		if days > 0 && !date.IsZero() && time.Since(date) > time.Duration(days)*24*time.Hour {
+			continue
+		}
+		addrs := make([]string, 0, len(msg.Envelope.To))
+		for _, a := range msg.Envelope.To {
+			if a == nil {
+				continue
+			}
+			if addr := a.Address(); addr != "" {
+				addrs = append(addrs, addr)
+			}
+		}
+		if len(addrs) == 0 {
+			continue
+		}
+		out = append(out, DeliveryHit{Addresses: addrs, Date: date})
+	}
+	if err := <-done; err != nil {
+		return nil, err
+	}
+	sort.SliceStable(out, func(i, j int) bool { return out[i].Date.After(out[j].Date) })
+	return out, nil
+}
+
+// ParseMessageDate 解析邮件头部日期。Web API 回退路径复用它,避免重复实现。
+func ParseMessageDate(raw string) time.Time {
+	return parseMessageDate(raw)
+}
+
+// SplitAddresses 从 To 头文本解析出邮箱地址列表。
+//
+// IMAP 信封里已经是结构化地址,只有 Web API 返回的是原始头部文本,
+// 需要同时容忍 "名字 <a@b>" 与不规范的分隔符。
+func SplitAddresses(raw string) []string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	if list, err := mail.ParseAddressList(raw); err == nil {
+		out := make([]string, 0, len(list))
+		for _, a := range list {
+			if a != nil && a.Address != "" {
+				out = append(out, a.Address)
+			}
+		}
+		if len(out) > 0 {
+			return out
+		}
+	}
+	parts := strings.FieldsFunc(raw, func(r rune) bool { return r == ',' || r == ';' })
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if i, j := strings.LastIndex(p, "<"), strings.LastIndex(p, ">"); i >= 0 && j > i {
+			p = p[i+1 : j]
+		}
+		p = strings.TrimSpace(strings.Trim(p, `"`))
+		if strings.Contains(p, "@") {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
 // FindByRecipient 查找发给指定隐私邮箱别名的最近 limit 封邮件(新→旧)。
 //
 // 先尝试 IMAP TO 搜索; 失败则只扫收件箱最近若干封本地过滤。

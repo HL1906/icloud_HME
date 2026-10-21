@@ -75,25 +75,40 @@ type Entry struct {
 	AccountID string `json:"account_id,omitempty"`
 	GroupID   string `json:"group_id,omitempty"`
 	Note      string `json:"note,omitempty"`
-	UpdatedAt string `json:"updated_at"`
+	// LastReceivedAt 是扫描收件箱得出的"最近一次收到投递到该别名的时间"。
+	// 它只是 iCloud 收件箱内容的观测结果,不参与任何同步,清空也无副作用。
+	LastReceivedAt string `json:"last_received_at,omitempty"`
+	UpdatedAt      string `json:"updated_at"`
+}
+
+// Activity 是某个账号最近一次收信活动扫描的摘要。
+type Activity struct {
+	AccountID  string `json:"account_id"`
+	LastScanAt string `json:"last_scan_at,omitempty"`
+	// Scanned 是本次扫描的邮件封数,Matched 是其中命中别名的封数。
+	Scanned    int `json:"scanned"`
+	Matched    int `json:"matched"`
+	WindowDays int `json:"window_days"`
 }
 
 // Store 是线程安全的分组与别名元数据存储。
 //
 // 没有数据目录时退化为纯内存(服务重启即丢),便于临时运行与测试。
 type Store struct {
-	mu      sync.Mutex
-	groups  []Group
-	entries map[string]Entry
-	file    string
-	now     func() time.Time
+	mu       sync.Mutex
+	groups   []Group
+	entries  map[string]Entry
+	activity map[string]Activity
+	file     string
+	now      func() time.Time
 }
 
 // NewStore 创建存储并载入 alias_meta.json。dataDir 为空表示只在内存中保存。
 func NewStore(dataDir string) (*Store, error) {
 	s := &Store{
-		entries: make(map[string]Entry),
-		now:     time.Now,
+		entries:  make(map[string]Entry),
+		activity: make(map[string]Activity),
+		now:      time.Now,
 	}
 	if dataDir == "" {
 		return s, nil
@@ -119,14 +134,18 @@ func (s *Store) load() error {
 		return err
 	}
 	var wrapper struct {
-		Groups  []Group          `json:"groups"`
-		Entries map[string]Entry `json:"entries"`
+		Groups   []Group          `json:"groups"`
+		Entries  map[string]Entry `json:"entries"`
+		Activity map[string]Activity `json:"activity"`
 	}
 	if err := json.Unmarshal(raw, &wrapper); err != nil {
 		return nil
 	}
 	if len(wrapper.Groups) > 0 {
 		s.groups = wrapper.Groups
+	}
+	if len(wrapper.Activity) > 0 {
+		s.activity = wrapper.Activity
 	}
 	for key, entry := range wrapper.Entries {
 		if entry.Email == "" {
@@ -154,12 +173,14 @@ func (s *Store) saveLocked() error {
 		return nil
 	}
 	wrapper := struct {
-		Groups    []Group          `json:"groups"`
-		Entries   map[string]Entry `json:"entries"`
-		UpdatedAt string           `json:"updated_at"`
+		Groups    []Group            `json:"groups"`
+		Entries   map[string]Entry   `json:"entries"`
+		Activity  map[string]Activity `json:"activity,omitempty"`
+		UpdatedAt string             `json:"updated_at"`
 	}{
 		Groups:    s.groups,
 		Entries:   s.entries,
+		Activity:  s.activity,
 		UpdatedAt: s.now().Format(time.RFC3339),
 	}
 	raw, err := json.MarshalIndent(wrapper, "", "  ")
@@ -332,8 +353,8 @@ func (s *Store) DeleteGroup(id string) (int, error) {
 		}
 		entry.GroupID = ""
 		entry.UpdatedAt = s.now().Format(time.RFC3339)
-		if entry.Note == "" {
-			// 既没分组也没备注就没必要留着这条记录了
+		if isBlank(entry) {
+			// 既没分组、没备注、也没有收信记录,就没必要留着这条记录了
 			delete(s.entries, key)
 		} else {
 			s.entries[key] = entry
@@ -371,6 +392,17 @@ func (s *Store) Upsert(email, accountID, groupID, note string) (Entry, error) {
 		if !ok {
 			return Entry{Email: key}, nil
 		}
+		if prev.LastReceivedAt != "" {
+			// 还有收信记录,不能整条删掉,只清分组与备注
+			next := prev
+			next.GroupID, next.Note, next.UpdatedAt = "", "", s.now().Format(time.RFC3339)
+			s.entries[key] = next
+			if err := s.saveLocked(); err != nil {
+				s.entries[key] = prev
+				return Entry{}, err
+			}
+			return next, nil
+		}
 		delete(s.entries, key)
 		if err := s.saveLocked(); err != nil {
 			s.entries[key] = prev
@@ -389,6 +421,10 @@ func (s *Store) Upsert(email, accountID, groupID, note string) (Entry, error) {
 	}
 	if entry.AccountID == "" && hadPrev {
 		entry.AccountID = prev.AccountID
+	}
+	if hadPrev {
+		// 收信时间是观测结果,编辑分组/备注不应该丢掉它
+		entry.LastReceivedAt = prev.LastReceivedAt
 	}
 	s.entries[key] = entry
 	if err := s.saveLocked(); err != nil {
@@ -449,12 +485,14 @@ func (s *Store) AssignGroupBulk(emails []string, accountID, groupID string) (int
 			GroupID:   groupID,
 			Note:      old.Note,
 			UpdatedAt: updatedAt,
+			// 归组不改变收信事实,照原样保留
+			LastReceivedAt: old.LastReceivedAt,
 		}
 		if next.AccountID == "" {
 			next.AccountID = old.AccountID
 		}
-		if next.GroupID == "" && next.Note == "" {
-			// 移出分组且无备注:与其留一条空记录,不如直接删掉
+		if isBlank(next) {
+			// 移出分组、无备注、也没收过信:与其留一条空记录,不如直接删掉
 			delete(s.entries, key)
 		} else {
 			s.entries[key] = next
@@ -472,6 +510,87 @@ func (s *Store) AssignGroupBulk(emails []string, accountID, groupID string) (int
 		return 0, err
 	}
 	return applied, nil
+}
+
+// ApplyActivity 把一次收件箱扫描的结果写入本地元数据。
+//
+// hits 是「别名邮箱(小写) → 最近收信时间」;只前进不后退:
+// 已有记录比新值更新时保留原值,避免两次扫描乱序把时间改小。
+// scanned 为本次扫描邮件数,windowDays 为扫描窗口,一并记入账号级摘要。
+// 返回最近收信时间确实被刷新的别名数量。
+func (s *Store) ApplyActivity(accountID string, hits map[string]time.Time, scanned, windowDays int, at time.Time) (int, error) {
+	accountID = strings.TrimSpace(accountID)
+	if accountID == "" {
+		return 0, ErrInvalidEmail
+	}
+	updatedAt := at.Format(time.RFC3339)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	type change struct {
+		key  string
+		prev Entry
+		had  bool
+	}
+	var changes []change
+
+	for rawEmail, when := range hits {
+		key := normalizeEmail(rawEmail)
+		if key == "" {
+			continue
+		}
+		old, had := s.entries[key]
+		if old.LastReceivedAt != "" {
+			if prevTime, err := time.Parse(time.RFC3339, old.LastReceivedAt); err == nil && !when.After(prevTime) {
+				continue
+			}
+		}
+		next := old
+		next.Email = key
+		if next.AccountID == "" {
+			next.AccountID = accountID
+		}
+		next.LastReceivedAt = when.Format(time.RFC3339)
+		next.UpdatedAt = updatedAt
+		changes = append(changes, change{key: key, prev: old, had: had})
+		s.entries[key] = next
+	}
+
+	prevAct, hadAct := s.activity[accountID]
+	s.activity[accountID] = Activity{
+		AccountID:  accountID,
+		LastScanAt: updatedAt,
+		Scanned:    scanned,
+		Matched:    len(hits),
+		WindowDays: windowDays,
+	}
+
+	if err := s.saveLocked(); err != nil {
+		for _, c := range changes {
+			if c.had {
+				s.entries[c.key] = c.prev
+			} else {
+				delete(s.entries, c.key)
+			}
+		}
+		if hadAct {
+			s.activity[accountID] = prevAct
+		} else {
+			delete(s.activity, accountID)
+		}
+		return 0, err
+	}
+	return len(changes), nil
+}
+
+// GetActivity 返回账号最近一次扫描摘要。
+func (s *Store) GetActivity(accountID string) (Activity, bool) {
+	accountID = strings.TrimSpace(accountID)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	act, ok := s.activity[accountID]
+	return act, ok
 }
 
 // DeleteEntry 删除某个别名的本地元数据(别名从 iCloud 删除时调用)。
@@ -501,13 +620,17 @@ func (s *Store) DeleteEntry(email string) (bool, error) {
 func (s *Store) ResetEntries() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if len(s.entries) == 0 {
+	if len(s.entries) == 0 && len(s.activity) == 0 {
 		return nil
 	}
 	prev := s.entries
+	prevAct := s.activity
 	s.entries = make(map[string]Entry)
+	// 别名都换了,扫描摘要也不再成立
+	s.activity = make(map[string]Activity)
 	if err := s.saveLocked(); err != nil {
 		s.entries = prev
+		s.activity = prevAct
 		return err
 	}
 	return nil
@@ -529,16 +652,26 @@ func (s *Store) DeleteByAccount(accountID string) (int, error) {
 		removed[key] = entry
 		delete(s.entries, key)
 	}
-	if len(removed) == 0 {
+	prevAct, hadAct := s.activity[accountID]
+	delete(s.activity, accountID)
+	if len(removed) == 0 && !hadAct {
 		return 0, nil
 	}
 	if err := s.saveLocked(); err != nil {
 		for key, entry := range removed {
 			s.entries[key] = entry
 		}
+		if hadAct {
+			s.activity[accountID] = prevAct
+		}
 		return 0, err
 	}
 	return len(removed), nil
+}
+
+// isBlank 判断一条记录是否只剩下"邮箱"这个键,没有任何值得保存的信息。
+func isBlank(e Entry) bool {
+	return e.GroupID == "" && e.Note == "" && e.LastReceivedAt == ""
 }
 
 func (s *Store) groupExistsLocked(id string) bool {

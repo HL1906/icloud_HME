@@ -2,6 +2,7 @@ package server
 
 import (
 	"fmt"
+	"hash/fnv"
 	"math/rand"
 	"sort"
 	"strings"
@@ -65,6 +66,45 @@ func (s *demoStore) list() []hme.Alias {
 	out := make([]hme.Alias, len(s.aliases))
 	copy(out, s.aliases)
 	sort.SliceStable(out, func(i, j int) bool { return out[i].CreatedAt > out[j].CreatedAt })
+	return out
+}
+
+// demoActivityBase 给三个初始演示别名固定"最近收信"天数,0 表示从未收信。
+//
+// 写死而不是随机,是为了让「从未收信」「久未收信」两个筛选一打开就有内容可看。
+var demoActivityBase = map[string]int{
+	"swift.otter.4821@icloud.com": 2,   // 两天前还在收信
+	"quiet.harbor.7315@icloud.com": 0,  // 从未收到过邮件
+	"amber.finch.2094@icloud.com": 118, // 停用已久,近四个月没动静
+}
+
+// activity 模拟一次收信扫描的结果:为每个假别名给出一个"最近收信时间"。
+//
+// 只返回确实收过信的别名,没有出现在 map 里的就是"从未收信",
+// 与真实扫描的语义保持一致。
+func (s *demoStore) activity(owners map[string]struct{}, days int) map[string]time.Time {
+	if days <= 0 {
+		days = 90
+	}
+	now := time.Now()
+	out := make(map[string]time.Time, len(owners))
+	for email := range owners {
+		if fixed, ok := demoActivityBase[email]; ok {
+			if fixed == 0 {
+				continue
+			}
+			out[email] = now.AddDate(0, 0, -fixed)
+			continue
+		}
+		// 池里新建的假别名按邮箱散列出一个稳定结果,避免每次扫描数字乱跳
+		h := fnv.New32a()
+		_, _ = h.Write([]byte(email))
+		seed := int(h.Sum32() % 100)
+		if seed < 35 {
+			continue
+		}
+		out[email] = now.AddDate(0, 0, -(1 + seed%days))
+	}
 	return out
 }
 

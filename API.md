@@ -788,6 +788,62 @@ DELETE /api/alias-meta?email=xyz123@icloud.com
 X-CSRF-Token: <token>
 ```
 
+### 27. 扫描收信活动
+
+统计每个别名"最近一次收到邮件"的时间。别名都转发到同一个 iCloud 收件箱，因此只需扫一遍 INBOX：只取邮件的**信封**（不下载正文），用 `To` 头匹配别名列表。
+
+```http
+POST /api/alias-activity/scan
+X-CSRF-Token: <token>
+
+{"account_id": "acc_1", "days": 90, "limit": 500}
+```
+
+| 字段 | 取值 | 说明 |
+|---|---|---|
+| `account_id` | 必填 | 账号 ID |
+| `days` | 1–365，默认 90 | 只扫最近 N 天的邮件 |
+| `limit` | 1–2000，默认 500 | 最多拉取多少封信封 |
+
+```json
+{
+  "success": true,
+  "data": {
+    "account_id": "acc_1",
+    "method": "imap",
+    "scanned": 312,
+    "matched": 47,
+    "updated": 23,
+    "window_days": 90,
+    "last_scan_at": "2026-10-21T18:20:00+08:00"
+  }
+}
+```
+
+- `scanned` 本次扫描的邮件封数，`matched` 其中命中别名的封数，`updated` 收信时间被刷新的别名数。
+- 只前进不后退：两次扫描乱序也不会把已有时间改小。
+- 同一账号并发扫描返回 `409 ACTIVITY_BUSY`；账号既无 App 专用密码也无 Cookie 时返回 `400 VALIDATION_ERROR`。
+- 扫描结果写入本地 `alias_meta.json` 的 `last_received_at`，随 `GET /api/aliases` 的 `meta` 一起返回。
+
+### 28. 查询收信活动摘要
+
+```http
+GET /api/alias-activity?account_id=acc_1
+```
+
+```json
+{
+  "success": true,
+  "data": {
+    "account_id": "acc_1",
+    "available": true,
+    "activity": {"account_id": "acc_1", "last_scan_at": "2026-10-21T18:20:00+08:00", "scanned": 312, "matched": 47, "window_days": 90}
+  }
+}
+```
+
+`available` 为 `false` 表示该账号还没扫描过，`activity` 是零值。
+
 ---
 
 ## curl 使用示例（Cookie Jar + CSRF）
