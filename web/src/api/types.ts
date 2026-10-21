@@ -46,6 +46,71 @@ export interface Alias {
   createdAt?: string
 }
 
+/**
+ * 本系统自有的别名元数据。分组与备注不会同步到 iCloud，
+ * 只存在本地 alias_meta.json 里，用于自己归类管理。
+ */
+export interface AliasMeta {
+  email: string
+  account_id?: string
+  /** 空表示未分组 */
+  group_id?: string
+  note?: string
+  updated_at?: string
+}
+
+/** 分组（系统自有，非 iCloud 字段） */
+export interface Group {
+  id: string
+  name: string
+  color: string
+  note?: string
+  created_at: string
+  /** 本系统登记的、属于该分组的别名数量 */
+  alias_count: number
+}
+
+/** GET /api/aliases 的返回：别名 + 本地元数据 */
+export interface AliasListResult {
+  account_id: string
+  count: number
+  aliases: Alias[]
+  /** key 为小写邮箱；没有本地元数据的别名不会出现在这里 */
+  meta?: Record<string, AliasMeta>
+}
+
+/** 批量操作的单个目标 */
+export interface BulkAliasTarget {
+  anonymous_id: string
+  /** 删除时带上,便于服务端顺带清理本地分组记录 */
+  email?: string
+}
+
+/**
+ * 批量操作类型。
+ * - deactivate / reactivate / delete 落到 iCloud,逐条执行;
+ * - assign_group 只改本地元数据（group_id 为空表示移出分组）。
+ */
+export type BulkAliasAction = 'deactivate' | 'reactivate' | 'delete' | 'assign_group'
+
+/** 批量操作的单条结果 */
+export interface BulkAliasItemResult {
+  anonymous_id?: string
+  email?: string
+  ok: boolean
+  error?: string
+}
+
+/** POST /api/alias-bulk 的返回 */
+export interface BulkAliasResult {
+  action: BulkAliasAction
+  total: number
+  applied: number
+  succeeded: number
+  failed: number
+  results: BulkAliasItemResult[]
+}
+
 /** 邮件摘要 */
 export interface InboxMessage {
   id: string
@@ -89,4 +154,24 @@ export interface ForwardResult {
 export interface LoginResult {
   csrf_token: string
   expires_at: string
+}
+
+/** 别名池自动补号配置(前半为用户配置,后半为运行状态) */
+export interface PoolConfig {
+  account_id: string
+  enabled: boolean
+  target: number
+  /** active: 只算启用中的别名(默认);all: 算全部 */
+  count_mode: 'active' | 'all'
+  max_per_run: number
+  interval_sec: number
+  /** 自动创建的别名归入哪个本地分组（空 = 未分组） */
+  group_id?: string
+  last_check_at?: string
+  last_created_at?: string
+  last_created?: number
+  last_error?: string
+  /** 连续失败后自动暂停,需要重新保存配置解除 */
+  paused?: boolean
+  total_created: number
 }

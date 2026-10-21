@@ -115,7 +115,7 @@ export default function DashboardPage() {
           <>
             <Link className="btn-link" to={`/aliases?account_id=${encodeURIComponent(searchParams.get('account_id') ?? '')}`}>
               <IconAliases size={14} />
-              管理隐藏邮箱
+              管理邮箱
             </Link>
             <Link className="btn-link" to="/inbox">
               <IconInbox size={14} />

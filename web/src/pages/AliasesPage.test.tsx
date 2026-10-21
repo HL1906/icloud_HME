@@ -2,7 +2,7 @@ import { http, HttpResponse } from 'msw'
 import { render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { MemoryRouter, Route, Routes } from 'react-router-dom'
-import { beforeEach, describe, expect, it } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 import AliasesPage from './AliasesPage'
 import { server } from '../test/server'
 import { setCSRFToken } from '../api/client'
@@ -134,7 +134,7 @@ describe('AliasesPage', () => {
       ),
     )
     await userEvent.click(retry)
-    expect(await screen.findByText(/暂无别名/)).toBeInTheDocument()
+    expect(await screen.findByText(/暂无邮箱/)).toBeInTheDocument()
   })
 
   it('按 email/label 大小写不敏感搜索与 active 状态筛选', async () => {
@@ -194,7 +194,7 @@ describe('AliasesPage', () => {
     )
   })
 
-  it('创建别名:空标签/200 字符边界、成功后刷新并可复制邮箱', async () => {
+  it('创建邮箱:200 字符边界、成功后刷新并可复制邮箱', async () => {
     let created = false
     server.use(
       http.get('/api/accounts', () => HttpResponse.json({ success: true, data: accounts })),
@@ -226,10 +226,7 @@ describe('AliasesPage', () => {
     renderPage()
     await screen.findByText('alpha@icloud.com')
     const user = userEvent.setup()
-    await user.click(screen.getByRole('button', { name: /创建别名/ }))
-    // 空标签提交被阻止
-    await user.click(within(screen.getByRole('dialog')).getByRole('button', { name: /创建/ }))
-    expect(screen.getByRole('dialog')).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: /创建邮箱/ }))
     // 200 字符边界:输入 201 字符被截断到 200
     await user.type(
       screen.getByLabelText(/标签/),
@@ -238,6 +235,47 @@ describe('AliasesPage', () => {
     expect((screen.getByLabelText(/标签/) as HTMLInputElement).value.length).toBe(200)
     await user.click(within(screen.getByRole('dialog')).getByRole('button', { name: /创建/ }))
     expect(await screen.findByText('gamma@icloud.com')).toBeInTheDocument()
+  })
+
+  it('标签留空也能创建:iCloud 侧会补默认标签', async () => {
+    let created = false
+    let sentLabel: string | null = null
+    server.use(
+      http.get('/api/accounts', () => HttpResponse.json({ success: true, data: accounts })),
+      http.get('/api/aliases', () =>
+        HttpResponse.json({
+          success: true,
+          data: {
+            account_id: 'acc_1',
+            count: created ? 3 : 2,
+            aliases: created
+              ? [...aliases, { email: 'delta@icloud.com', anonymousId: 'anon_delta', label: '', active: true }]
+              : aliases,
+          },
+        }),
+      ),
+      http.post('/api/create', async ({ request }) => {
+        const body = (await request.json()) as { label?: string }
+        sentLabel = body.label ?? null
+        created = true
+        return HttpResponse.json({
+          success: true,
+          data: {
+            email: 'delta@icloud.com',
+            label: 'Created 2026-10-21 17:05',
+            created_at: '2026-10-21T17:05:00+08:00',
+            account_id: 'acc_1',
+          },
+        })
+      }),
+    )
+    renderPage()
+    await screen.findByText('alpha@icloud.com')
+    const user = userEvent.setup()
+    await user.click(screen.getByRole('button', { name: /创建邮箱/ }))
+    await user.click(within(screen.getByRole('dialog')).getByRole('button', { name: /创建/ }))
+    expect(await screen.findByText('delta@icloud.com')).toBeInTheDocument()
+    expect(sentLabel).toBe('')
   })
 
   it('停用别名:显示目标邮箱并二次确认', async () => {
@@ -324,5 +362,294 @@ describe('AliasesPage', () => {
     await user.click(screen.getByRole('button', { name: /确认停用/ }))
     expect(await screen.findByRole('alert')).toHaveTextContent('停用失败')
     expect(screen.getByText('alpha@icloud.com')).toBeInTheDocument()
+  })
+
+  it('展示本地分组与备注,编辑时邮箱只读、可改分组', async () => {
+    let putBody: Record<string, unknown> | null = null
+    server.use(
+      http.get('/api/accounts', () => HttpResponse.json({ success: true, data: accounts })),
+      http.get('/api/groups', () =>
+        HttpResponse.json({
+          success: true,
+          data: {
+            groups: [
+              { id: 'g_shop', name: '购物', color: 'amber', created_at: '', alias_count: 1 },
+            ],
+            count: 1,
+          },
+        }),
+      ),
+      http.get('/api/aliases', () =>
+        HttpResponse.json({
+          success: true,
+          data: {
+            account_id: 'acc_1',
+            count: 2,
+            aliases,
+            meta: {
+              'alpha@icloud.com': { email: 'alpha@icloud.com', group_id: 'g_shop', note: '注册试用' },
+            },
+          },
+        }),
+      ),
+      http.put('/api/alias-meta', async ({ request }) => {
+        putBody = (await request.json()) as Record<string, unknown>
+        return HttpResponse.json({
+          success: true,
+          data: { email: 'alpha@icloud.com', group_id: '', note: '' },
+        })
+      }),
+    )
+    renderPage()
+    await screen.findByText('alpha@icloud.com')
+    // 分组列显示归属,备注显示在邮箱下方(分组名同时出现在筛选下拉里,故限定在表格内)
+    await waitFor(() =>
+      expect(within(screen.getByRole('table')).getByText('购物')).toBeInTheDocument(),
+    )
+    expect(screen.getByText('注册试用')).toBeInTheDocument()
+
+    const user = userEvent.setup()
+    const alphaRow = within(screen.getByRole('table')).getByRole('row', { name: /alpha@icloud\.com/ })
+    await user.click(within(alphaRow).getByRole('button', { name: /编辑/ }))
+
+    const dialog = screen.getByRole('dialog')
+    const emailInput = within(dialog).getByLabelText('邮箱') as HTMLInputElement
+    expect(emailInput.value).toBe('alpha@icloud.com')
+    expect(emailInput).toBeDisabled()
+    expect(within(dialog).getByLabelText('分组')).toHaveValue('g_shop')
+
+    await user.selectOptions(within(dialog).getByLabelText('分组'), '')
+    await user.click(within(dialog).getByRole('button', { name: '保存' }))
+    await waitFor(() =>
+      expect(putBody).toMatchObject({
+        email: 'alpha@icloud.com',
+        account_id: 'acc_1',
+        group_id: '',
+      }),
+    )
+  })
+
+  it('按分组筛选:未分组与指定分组', async () => {
+    server.use(
+      http.get('/api/accounts', () => HttpResponse.json({ success: true, data: accounts })),
+      http.get('/api/groups', () =>
+        HttpResponse.json({
+          success: true,
+          data: {
+            groups: [
+              { id: 'g_shop', name: '购物', color: 'amber', created_at: '', alias_count: 1 },
+            ],
+            count: 1,
+          },
+        }),
+      ),
+      http.get('/api/aliases', () =>
+        HttpResponse.json({
+          success: true,
+          data: {
+            account_id: 'acc_1',
+            count: 2,
+            aliases,
+            meta: {
+              'alpha@icloud.com': { email: 'alpha@icloud.com', group_id: 'g_shop' },
+            },
+          },
+        }),
+      ),
+    )
+    renderPage()
+    await screen.findByText('alpha@icloud.com')
+    const user = userEvent.setup()
+
+    await user.selectOptions(screen.getByLabelText('分组'), 'g_shop')
+    expect(screen.getByText('alpha@icloud.com')).toBeInTheDocument()
+    expect(screen.queryByText('beta@icloud.com')).toBeNull()
+
+    await user.selectOptions(screen.getByLabelText('分组'), '__none__')
+    expect(await screen.findByText('beta@icloud.com')).toBeInTheDocument()
+    expect(screen.queryByText('alpha@icloud.com')).toBeNull()
+  })
+})
+
+/** 批量接口的请求体形状(测试断言用) */
+interface BulkPost {
+  account_id: string
+  action: string
+  group_id: string
+  aliases: { anonymous_id: string; email?: string }[]
+}
+
+describe('AliasesPage 批量操作', () => {
+  beforeEach(() => {
+    setCSRFToken('csrf-test')
+    server.resetHandlers()
+    server.use(
+      http.get('/api/accounts', () => HttpResponse.json({ success: true, data: accounts })),
+      http.get('/api/aliases', () =>
+        HttpResponse.json({
+          success: true,
+          data: { account_id: 'acc_1', count: 2, aliases },
+        }),
+      ),
+      http.get('/api/groups', () =>
+        HttpResponse.json({
+          success: true,
+          data: {
+            groups: [
+              {
+                id: 'g_shop',
+                name: '购物',
+                color: 'amber',
+                created_at: '2026-07-01T00:00:00+08:00',
+                alias_count: 0,
+              },
+            ],
+            count: 1,
+          },
+        }),
+      ),
+    )
+  })
+
+  it('全选当前页后只发一次请求批量停用', async () => {
+    let received: BulkPost | null = null
+    server.use(
+      http.post('/api/alias-bulk', async ({ request }) => {
+        received = (await request.json()) as BulkPost
+        return HttpResponse.json({
+          success: true,
+          data: {
+            action: 'deactivate',
+            total: 2,
+            applied: 2,
+            succeeded: 2,
+            failed: 0,
+            results: [
+              { anonymous_id: 'anon_alpha', ok: true },
+              { anonymous_id: 'anon_beta', ok: true },
+            ],
+          },
+        })
+      }),
+    )
+    renderPage()
+    await screen.findByText('alpha@icloud.com')
+    const user = userEvent.setup()
+
+    // 未勾选时不该出现批量条
+    expect(screen.queryByRole('region', { name: '批量操作' })).toBeNull()
+
+    await user.click(screen.getByLabelText('全选当前页'))
+    const bar = screen.getByRole('region', { name: '批量操作' })
+    expect(within(bar).getByText(/已选/)).toHaveTextContent('2')
+
+    await user.click(within(bar).getByRole('button', { name: '停用' }))
+    await user.click(within(screen.getByRole('dialog')).getByRole('button', { name: '确认停用' }))
+
+    await waitFor(() => expect(received).not.toBeNull())
+    expect(received!.action).toBe('deactivate')
+    expect(received!.account_id).toBe('acc_1')
+    expect(received!.aliases.map((a) => a.anonymous_id)).toEqual(['anon_alpha', 'anon_beta'])
+    // 删除时带上邮箱,便于服务端清理本地分组
+    expect(received!.aliases.map((a) => a.email)).toEqual(['alpha@icloud.com', 'beta@icloud.com'])
+
+    expect(await screen.findByText('已停用 2 个邮箱')).toBeInTheDocument()
+    // 成功后清空选择,批量条消失
+    await waitFor(() => expect(screen.queryByRole('region', { name: '批量操作' })).toBeNull())
+  })
+
+  it('部分失败时回显失败的邮箱与原因', async () => {
+    server.use(
+      http.post('/api/alias-bulk', () =>
+        HttpResponse.json({
+          success: true,
+          data: {
+            action: 'delete',
+            total: 2,
+            applied: 1,
+            succeeded: 1,
+            failed: 1,
+            results: [
+              { anonymous_id: 'anon_alpha', email: 'alpha@icloud.com', ok: true },
+              {
+                anonymous_id: 'anon_beta',
+                email: 'beta@icloud.com',
+                ok: false,
+                error: '上游返回 500',
+              },
+            ],
+          },
+        }),
+      ),
+    )
+    renderPage()
+    await screen.findByText('alpha@icloud.com')
+    const user = userEvent.setup()
+
+    await user.click(screen.getByLabelText('全选当前页'))
+    const bar = screen.getByRole('region', { name: '批量操作' })
+    await user.click(within(bar).getByRole('button', { name: /删除/ }))
+    // 批量删除不需要输入邮箱,直接确认
+    await user.click(within(screen.getByRole('dialog')).getByRole('button', { name: '确认删除' }))
+
+    const alert = await screen.findByRole('alert')
+    expect(alert).toHaveTextContent('1 个邮箱处理失败')
+    expect(alert).toHaveTextContent('beta@icloud.com')
+    expect(alert).toHaveTextContent('上游返回 500')
+
+    // 失败项保持勾选,方便直接重试
+    const stillSelected = screen.getByRole('region', { name: '批量操作' })
+    expect(within(stillSelected).getByText(/已选/)).toHaveTextContent('1')
+  })
+
+  it('批量归入分组:一次请求带 group_id', async () => {
+    let received: BulkPost | null = null
+    server.use(
+      http.post('/api/alias-bulk', async ({ request }) => {
+        received = (await request.json()) as BulkPost
+        return HttpResponse.json({
+          success: true,
+          data: {
+            action: 'assign_group',
+            group_id: 'g_shop',
+            total: 2,
+            applied: 2,
+            succeeded: 2,
+            failed: 0,
+            results: [],
+          },
+        })
+      }),
+    )
+    renderPage()
+    await screen.findByText('alpha@icloud.com')
+    const user = userEvent.setup()
+
+    await user.click(screen.getByLabelText('全选当前页'))
+    await user.selectOptions(screen.getByLabelText('批量归入分组'), 'g_shop')
+
+    await waitFor(() => expect(received).not.toBeNull())
+    expect(received!.action).toBe('assign_group')
+    expect(received!.group_id).toBe('g_shop')
+    expect(received!.aliases).toHaveLength(2)
+    expect(await screen.findByText('已归入分组 2 个邮箱')).toBeInTheDocument()
+  })
+
+  it('导出 CSV:按当前筛选结果生成文件', async () => {
+    const createObjectURL = vi.fn(() => 'blob:mock')
+    const revokeObjectURL = vi.fn()
+    Object.assign(URL, { createObjectURL, revokeObjectURL })
+    const click = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => {})
+
+    renderPage()
+    await screen.findByText('alpha@icloud.com')
+    const user = userEvent.setup()
+    await user.click(screen.getByRole('button', { name: /导出 CSV/ }))
+
+    expect(createObjectURL).toHaveBeenCalledTimes(1)
+    expect(click).toHaveBeenCalledTimes(1)
+    expect(await screen.findByText('已导出 2 条')).toBeInTheDocument()
+
+    click.mockRestore()
   })
 })

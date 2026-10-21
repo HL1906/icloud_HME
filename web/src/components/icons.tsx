@@ -28,6 +28,15 @@ export function IconAccounts(props: IconProps) {
   )
 }
 
+export function IconGroups(props: IconProps) {
+  return (
+    <svg {...base(props)}>
+      <path d="M3 7.5A2.5 2.5 0 0 1 5.5 5h3.2c.6 0 1.2.25 1.6.7l1 1.2c.4.45 1 .7 1.6.7h5.6A2.5 2.5 0 0 1 21 10v6.5a2.5 2.5 0 0 1-2.5 2.5h-13A2.5 2.5 0 0 1 3 16.5z" />
+      <path d="M8 13h8" />
+    </svg>
+  )
+}
+
 export function IconAliases(props: IconProps) {
   return (
     <svg {...base(props)}>
@@ -264,6 +273,17 @@ export function IconEyeOff(props: IconProps) {
       <path d="M9.9 4.2A10.4 10.4 0 0 1 12 4c6.5 0 10 7 10 7a18.6 18.6 0 0 1-2.2 3.2" />
       <path d="M9.9 9.9a3 3 0 0 0 4.2 4.2" />
       <path d="M2 2l20 20" />
+    </svg>
+  )
+}
+
+// IconDownload 用于「导出 CSV」。
+export function IconDownload(props: IconProps) {
+  return (
+    <svg {...base(props)}>
+      <path d="M12 3v12" />
+      <path d="M7 11l5 5 5-5" />
+      <path d="M4 20h16" />
     </svg>
   )
 }

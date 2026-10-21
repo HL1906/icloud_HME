@@ -100,6 +100,38 @@ describe('AccountsPage', () => {
     expect(screen.queryByText(/cookie-secret|app-secret|proxy-secret/)).toBeNull()
   })
 
+  it('显示自动补号状态,并在更多菜单提供入口', async () => {
+    server.use(
+      http.get('/api/accounts', () => HttpResponse.json({ success: true, data: accounts })),
+      http.get('/api/pool', () =>
+        HttpResponse.json({
+          success: true,
+          data: {
+            configs: [
+              {
+                account_id: 'acc_active',
+                enabled: true,
+                target: 20,
+                count_mode: 'active',
+                max_per_run: 3,
+                interval_sec: 300,
+                group_id: '',
+                total_created: 5,
+              },
+            ],
+          },
+        }),
+      ),
+    )
+    renderPage()
+
+    expect(await screen.findByText(/自动补至 20 · 已建 5/)).toBeInTheDocument()
+
+    const user = userEvent.setup()
+    await clickInMoreMenu(user, /自动补号/)
+    expect(await screen.findByText(/自动补号 · 活跃号/)).toBeInTheDocument()
+  })
+
   it('添加账号:校验必填、请求期间禁用、成功刷新', async () => {
     let listData = accounts
     server.use(

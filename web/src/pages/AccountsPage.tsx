@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { request, ApiError } from '../api/client'
-import type { AccountSummary } from '../api/types'
+import type { AccountSummary, PoolConfig } from '../api/types'
 import AsyncState from '../components/AsyncState'
 import AccountFormDialog from '../components/AccountFormDialog'
 import CookieDialog from '../components/CookieDialog'
@@ -9,6 +9,7 @@ import ICloudLoginDialog from '../components/ICloudLoginDialog'
 import AppPasswordDialog from '../components/AppPasswordDialog'
 import ProxyDialog from '../components/ProxyDialog'
 import MailboxDialog from '../components/MailboxDialog'
+import PoolDialog from '../components/PoolDialog'
 import ConfirmDialog from '../components/ConfirmDialog'
 import DropdownMenu from '../components/DropdownMenu'
 import PageHeader from '../components/PageHeader'
@@ -23,6 +24,7 @@ import {
   IconTrash,
   IconKey,
   IconMail,
+  IconRefresh,
   IconSearch,
 } from '../components/icons'
 
@@ -87,6 +89,12 @@ export default function AccountsPage() {
   const [mailboxFor, setMailboxFor] = useState<AccountSummary | null>(null)
   const [deleteFor, setDeleteFor] = useState<AccountSummary | null>(null)
   const [deleting, setDeleting] = useState(false)
+  // 自动补号配置:key 为账号 ID。接口未启用时保持空对象,页面不显示相关入口。
+  const [poolConfigs, setPoolConfigs] = useState<Record<string, PoolConfig>>({})
+  const [poolFor, setPoolFor] = useState<AccountSummary | null>(null)
+  const [poolAvailable, setPoolAvailable] = useState(true)
+  // 保存补号配置后 +1,触发上面 effect 重新拉取
+  const [poolRefreshKey, setPoolRefreshKey] = useState(0)
   // 后台校验的轮询次数上限:60s 仍未有结果就停止,避免异常时无限打服务端
   const pollAttempts = useRef(0)
 
@@ -162,6 +170,27 @@ export default function AccountsPage() {
     }, 2000)
     return () => window.clearTimeout(timer)
   }, [accounts])
+
+  // 自动补号配置单独拉取:该功能可能未启用(503),失败时静默降级为不显示
+  useEffect(() => {
+    let cancelled = false
+    request<{ configs: PoolConfig[] }>('/api/pool')
+      .then((data) => {
+        if (cancelled) return
+        const map: Record<string, PoolConfig> = {}
+        for (const cfg of data.configs ?? []) map[cfg.account_id] = cfg
+        setPoolConfigs(map)
+        setPoolAvailable(true)
+      })
+      .catch(() => {
+        if (cancelled) return
+        setPoolConfigs({})
+        setPoolAvailable(false)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [retryKey, poolRefreshKey])
 
   function handleRetry() {
     setLoading(true)
@@ -262,6 +291,14 @@ export default function AccountsPage() {
                     <span className="cell-strong">
                       {acc.alias_active} / {acc.alias_total}
                     </span>
+                    {poolConfigs[acc.id] && (
+                      <span className="cell-secondary">
+                        {poolConfigs[acc.id].enabled
+                          ? `自动补至 ${poolConfigs[acc.id].target} · 已建 ${poolConfigs[acc.id].total_created}`
+                          : '自动补号已关闭'}
+                        {poolConfigs[acc.id].paused ? ' · 已暂停' : ''}
+                      </span>
+                    )}
                   </td>
                   <td>{credText(acc)}</td>
                   <td>{formatValidated(acc.last_validated)}</td>
@@ -285,6 +322,12 @@ export default function AccountsPage() {
                         </button>
                         <button onClick={() => setMailboxFor(acc)}>接入收件邮箱</button>
                         <button onClick={() => setProxyFor(acc)}>设置代理</button>
+                        {poolAvailable && (
+                          <button onClick={() => setPoolFor(acc)}>
+                            <IconRefresh size={14} />
+                            自动补号
+                          </button>
+                        )}
                         <Link to={`/inbox?account_id=${acc.id}`}>
                           <IconMail size={14} />
                           收件箱
@@ -379,6 +422,22 @@ export default function AccountsPage() {
           open
           onClose={() => setMailboxFor(null)}
           onSaved={() => { setMailboxFor(null); show('收件邮箱已接入'); void load() }}
+        />
+      )}
+      {poolFor && (
+        <PoolDialog
+          key={poolFor.id}
+          accountId={poolFor.id}
+          accountName={poolFor.name}
+          config={poolConfigs[poolFor.id] ?? null}
+          open
+          onClose={() => setPoolFor(null)}
+          onSaved={(message) => {
+            setPoolFor(null)
+            show(message)
+            setPoolRefreshKey((k) => k + 1)
+            void load()
+          }}
         />
       )}
       {deleteFor && (

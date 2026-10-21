@@ -6,6 +6,7 @@ import LoginPage from './pages/LoginPage'
 import DashboardPage from './pages/DashboardPage'
 import AccountsPage from './pages/AccountsPage'
 import AliasesPage from './pages/AliasesPage'
+import GroupsPage from './pages/GroupsPage'
 import InboxPage from './pages/InboxPage'
 
 function ProtectedLayout() {
@@ -30,6 +31,7 @@ export default function App() {
               <Route path="/dashboard" element={<DashboardPage />} />
               <Route path="/accounts" element={<AccountsPage />} />
               <Route path="/aliases" element={<AliasesPage />} />
+              <Route path="/groups" element={<GroupsPage />} />
               <Route path="/inbox" element={<InboxPage />} />
               <Route path="*" element={<Navigate to="/dashboard" replace />} />
             </Route>
