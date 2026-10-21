@@ -48,6 +48,48 @@ export function IconInbox(props: IconProps) {
   )
 }
 
+// IconDashboard 用于「总览」导航项。
+export function IconDashboard(props: IconProps) {
+  return (
+    <svg {...base(props)}>
+      <rect x="3" y="3" width="7" height="7" rx="1.5" />
+      <rect x="14" y="3" width="7" height="7" rx="1.5" />
+      <rect x="3" y="14" width="7" height="7" rx="1.5" />
+      <rect x="14" y="14" width="7" height="7" rx="1.5" />
+    </svg>
+  )
+}
+
+// IconSend 用于「转发」相关语义。
+export function IconSend(props: IconProps) {
+  return (
+    <svg {...base(props)}>
+      <path d="M22 2 11 13" />
+      <path d="M22 2 15 22l-4-9-9-4z" />
+    </svg>
+  )
+}
+
+// IconChevronRight 用于面包屑分隔符。
+export function IconChevronRight(props: IconProps) {
+  return (
+    <svg {...base(props)}>
+      <path d="M9 18l6-6-6-6" />
+    </svg>
+  )
+}
+
+// IconMenu 用于移动端菜单按钮。
+export function IconMenu(props: IconProps) {
+  return (
+    <svg {...base(props)}>
+      <path d="M3 6h18" />
+      <path d="M3 12h18" />
+      <path d="M3 18h18" />
+    </svg>
+  )
+}
+
 export function IconPlus(props: IconProps) {
   return (
     <svg {...base(props)}>
@@ -200,6 +242,28 @@ export function IconLock(props: IconProps) {
     <svg {...base(props)}>
       <rect x="3" y="11" width="18" height="11" rx="2" />
       <path d="M7 11V7a5 5 0 0 1 10 0v4" />
+    </svg>
+  )
+}
+
+// IconEye 用于「显示密码」。
+export function IconEye(props: IconProps) {
+  return (
+    <svg {...base(props)}>
+      <path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7z" />
+      <circle cx="12" cy="12" r="3" />
+    </svg>
+  )
+}
+
+// IconEyeOff 用于「隐藏密码」。
+export function IconEyeOff(props: IconProps) {
+  return (
+    <svg {...base(props)}>
+      <path d="M17.9 17.9A10.4 10.4 0 0 1 12 19c-6.5 0-10-7-10-7a18.5 18.5 0 0 1 4.2-5" />
+      <path d="M9.9 4.2A10.4 10.4 0 0 1 12 4c6.5 0 10 7 10 7a18.6 18.6 0 0 1-2.2 3.2" />
+      <path d="M9.9 9.9a3 3 0 0 0 4.2 4.2" />
+      <path d="M2 2l20 20" />
     </svg>
   )
 }

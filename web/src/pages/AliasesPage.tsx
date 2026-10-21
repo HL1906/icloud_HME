@@ -5,6 +5,8 @@ import type { AccountSummary, Alias } from '../api/types'
 import AsyncState from '../components/AsyncState'
 import CreateAliasDialog from '../components/CreateAliasDialog'
 import ConfirmDialog from '../components/ConfirmDialog'
+import PageHeader from '../components/PageHeader'
+import Pagination from '../components/Pagination'
 import { useToast } from '../components/ToastProvider'
 import { copyText } from '../utils/clipboard'
 import {
@@ -67,6 +69,9 @@ export default function AliasesPage() {
   const [search, setSearch] = useState('')
   const [filter, setFilter] = useState<'all' | 'active' | 'inactive'>('all')
   const [sortDirection, setSortDirection] = useState<SortDirection>('desc')
+  // 客户端分页:别名通常在几十到几百条,一次拉全量再本地分页体验最好
+  const [page, setPage] = useState(1)
+  const [pageSize, setPageSize] = useState(20)
   const [createOpen, setCreateOpen] = useState(false)
   const [confirm, setConfirm] = useState<{
     type: 'deactivate' | 'reactivate' | 'delete'
@@ -157,6 +162,10 @@ export default function AliasesPage() {
       .map(({ alias }) => alias)
   }, [aliases, search, filter, sortDirection])
 
+  // 当前页的数据切片(过滤+排序之后)
+  const safePage = Math.min(page, Math.max(1, Math.ceil(filtered.length / pageSize)))
+  const pageAliases = filtered.slice((safePage - 1) * pageSize, safePage * pageSize)
+
   function handleRetry() {
     setLoading(true)
     setRetryKey((k) => k + 1)
@@ -225,69 +234,63 @@ export default function AliasesPage() {
 
   return (
     <section>
-      <div className="page-header">
-        <div className="page-title">
-          <h2>别名管理</h2>
-          <p>创建、停用、激活或删除 Hide My Email 别名</p>
-        </div>
-        <div style={{ display: 'flex', gap: 12, alignItems: 'center', flexWrap: 'wrap' }}>
-          <label htmlFor="alias-account">账号</label>
-          <select
-            id="alias-account"
-            value={accountId}
-            onChange={(e) => {
-              setAccountId(e.target.value)
-              setSearchParams({ account_id: e.target.value }, { replace: true })
-            }}
-            style={{ width: 'auto' }}
-          >
-            {accounts.map((a) => (
-              <option key={a.id} value={a.id}>
-                {a.name}
-              </option>
-            ))}
-          </select>
-          <button className="primary" onClick={() => setCreateOpen(true)} disabled={!accountId}>
-            <IconPlus size={16} />
-            创建别名
-          </button>
-        </div>
-      </div>
+      <PageHeader
+        title="隐藏邮箱"
+        actions={
+          <>
+            <label className="inline-label" htmlFor="alias-account">
+              账号
+            </label>
+            <select
+              id="alias-account"
+              value={accountId}
+              onChange={(e) => {
+                setAccountId(e.target.value)
+                setSearchParams({ account_id: e.target.value }, { replace: true })
+              }}
+              style={{ width: 'auto' }}
+            >
+              {accounts.map((a) => (
+                <option key={a.id} value={a.id}>
+                  {a.name}
+                </option>
+              ))}
+            </select>
+            <button className="primary" onClick={() => setCreateOpen(true)} disabled={!accountId}>
+              <IconPlus size={16} />
+              创建别名
+            </button>
+          </>
+        }
+      />
 
-      <div style={{ display: 'flex', gap: 12, marginBottom: 16, flexWrap: 'wrap' }}>
-        <div style={{ flex: 1, minWidth: 200 }}>
+      <div className="data-panel">
+        <div className="toolbar">
+          <div className="toolbar-field toolbar-grow">
           <label htmlFor="alias-search">搜索</label>
-          <div style={{ position: 'relative' }}>
+          <div className="search-input">
             <input
               id="alias-search"
               type="search"
               value={search}
-              onChange={(e) => setSearch(e.target.value)}
-              placeholder="按邮箱或标签搜索"
-              style={{ paddingRight: 36 }}
-            />
-            <span
-              aria-hidden="true"
-              style={{
-                position: 'absolute',
-                right: 10,
-                top: '50%',
-                transform: 'translateY(-50%)',
-                color: 'var(--color-text-tertiary)',
-                display: 'flex',
-                pointerEvents: 'none',
+              onChange={(e) => {
+                setSearch(e.target.value)
+                setPage(1)
               }}
-            >
-              <IconSearch size={16} />
-            </span>
+              placeholder="按邮箱或标签搜索"
+            />
+            <IconSearch size={16} />
           </div>
         </div>
-        <div>
+        <div className="toolbar-field">
           <label htmlFor="alias-filter">状态</label>
           <select
             id="alias-filter"
             value={filter}
-            onChange={(e) => setFilter(e.target.value as 'all' | 'active' | 'inactive')}
+            onChange={(e) => {
+              setFilter(e.target.value as 'all' | 'active' | 'inactive')
+              setPage(1)
+            }}
             style={{ width: 'auto' }}
           >
             <option value="all">全部</option>
@@ -295,13 +298,13 @@ export default function AliasesPage() {
             <option value="inactive">已停用</option>
           </select>
         </div>
-      </div>
+        </div>
 
-      <AsyncState
-        loading={loading}
-        error={error}
-        empty={filtered.length === 0}
-        emptyText={aliases.length === 0 ? '暂无别名' : '没有匹配的别名'}
+        <AsyncState
+          loading={loading}
+          error={error}
+          empty={filtered.length === 0}
+          emptyText={aliases.length === 0 ? '暂无别名' : '没有匹配的别名'}
         onRetry={handleRetry}
       >
         <div className="table-wrap">
@@ -327,7 +330,7 @@ export default function AliasesPage() {
               </tr>
             </thead>
             <tbody>
-              {filtered.map((alias) => (
+              {pageAliases.map((alias) => (
                 <tr key={alias.anonymousId}>
                   <td>
                     <button
@@ -386,7 +389,19 @@ export default function AliasesPage() {
             </tbody>
           </table>
         </div>
-      </AsyncState>
+        </AsyncState>
+        <Pagination
+          page={safePage}
+          pageSize={pageSize}
+          total={filtered.length}
+          onPageChange={setPage}
+          onPageSizeChange={(size) => {
+            setPageSize(size)
+            setPage(1)
+          }}
+          showWhenEmpty
+        />
+      </div>
 
       <CreateAliasDialog
         accountId={accountId}

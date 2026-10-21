@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useState } from 'react'
 import Dialog from './Dialog'
 import { request, ApiError } from '../api/client'
 import type { MailboxSummary } from '../api/types'
@@ -19,16 +19,6 @@ export default function MailboxDialog({ accountId, current, open, onClose, onSav
   const [code, setCode] = useState('')
   const [error, setError] = useState('')
   const [submitting, setSubmitting] = useState(false)
-
-  useEffect(() => {
-    if (!open) return
-    setProvider(current?.provider || 'qq')
-    setEmail(current?.email || '')
-    setHost(current?.imap_host || 'imap.qq.com')
-    setPort(String(current?.imap_port || 993))
-    setCode('')
-    setError('')
-  }, [open, current])
 
   function changeProvider(value: string) {
     setProvider(value)

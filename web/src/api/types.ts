@@ -17,7 +17,8 @@ export interface AccountSummary {
   real_email: string
   icloud_email: string
   host: string
-  status: 'active' | 'pending' | 'error' | string
+  /** validating: 添加后正在后台校验会话;pending: 尚未配置凭据 */
+  status: 'active' | 'validating' | 'pending' | 'error' | string
   alias_total: number
   alias_active: number
   has_cookies: boolean
@@ -66,6 +67,21 @@ export interface InboxResult {
   alias?: string
   count: number
   messages: InboxMessage[]
+  method: 'imap' | 'web_api'
+}
+
+/** 转发专用邮件(带已转发标记) */
+export interface ForwardMessage extends InboxMessage {
+  forwarded: boolean
+  body?: string
+}
+
+/** 转发专用查询结果 */
+export interface ForwardResult {
+  account_id: string
+  alias: string
+  count: number
+  messages: ForwardMessage[]
   method: 'imap' | 'web_api'
 }
 

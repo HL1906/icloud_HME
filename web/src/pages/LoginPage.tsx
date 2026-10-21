@@ -1,15 +1,22 @@
-import { useState, type FormEvent } from 'react'
+import { useEffect, useRef, useState, type FormEvent } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useAuth } from '../auth/AuthProvider'
 import { ApiError } from '../api/client'
-import { IconLock, IconShield } from '../components/icons'
+import { IconEye, IconEyeOff, IconLock, IconShield } from '../components/icons'
 
 export default function LoginPage() {
   const { login } = useAuth()
   const navigate = useNavigate()
   const [password, setPassword] = useState('')
+  const [showPwd, setShowPwd] = useState(false)
   const [error, setError] = useState('')
   const [submitting, setSubmitting] = useState(false)
+  const passwordRef = useRef<HTMLInputElement>(null)
+
+  // 登录页只有一个输入框,进入即聚焦(比 autoFocus 更可控,a11y 规则也允许)
+  useEffect(() => {
+    passwordRef.current?.focus()
+  }, [])
 
   async function handleSubmit(e: FormEvent) {
     e.preventDefault()
@@ -18,11 +25,9 @@ export default function LoginPage() {
     setError('')
     try {
       await login(password)
-      navigate('/accounts', { replace: true })
+      navigate('/dashboard', { replace: true })
     } catch (err) {
-      setError(
-        err instanceof ApiError ? err.message : '网络连接失败，请检查服务状态',
-      )
+      setError(err instanceof ApiError ? err.message : '网络连接失败，请检查服务状态')
     } finally {
       setSubmitting(false)
     }
@@ -30,53 +35,56 @@ export default function LoginPage() {
 
   return (
     <div className="login-page">
-      <div className="login-brand">
-        <span className="logo" aria-hidden="true">
-          <IconShield size={28} />
-        </span>
-        <h1>iCloud HME 管理台</h1>
-        <p>管理你的 iCloud 隐藏邮箱别名与邮件</p>
-      </div>
-      <form onSubmit={handleSubmit} className="card login-form">
-        {error && (
-          <div className="alert-error" role="alert">
-            {error}
-          </div>
-        )}
-        <div className="form-field">
-          <label htmlFor="admin-password">管理员密码</label>
-          <div style={{ position: 'relative' }}>
-            <input
-              id="admin-password"
-              type="password"
-              autoComplete="current-password"
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
-              required
-              placeholder="请输入管理员密码"
-              style={{ paddingRight: 40 }}
-            />
-            <span
-              aria-hidden="true"
-              style={{
-                position: 'absolute',
-                right: 12,
-                top: '50%',
-                transform: 'translateY(-50%)',
-                color: 'var(--color-text-tertiary)',
-                display: 'flex',
-              }}
-            >
-              <IconLock size={18} />
-            </span>
-          </div>
+      <div className="login-card">
+        <div className="login-brand">
+          <span className="logo" aria-hidden="true">
+            <IconShield size={22} />
+          </span>
+          <h1>iCloud 隐藏邮箱管理台</h1>
         </div>
-        <div className="form-actions">
-          <button type="submit" className="primary" disabled={submitting}>
+
+        <form onSubmit={handleSubmit} className="login-form">
+          {error && (
+            <div className="alert-error" role="alert">
+              {error}
+            </div>
+          )}
+
+          <div className="form-field">
+            <label htmlFor="admin-password">管理员密码</label>
+            <div className="password-field">
+              <span className="password-icon" aria-hidden="true">
+                <IconLock size={15} />
+              </span>
+              <input
+                id="admin-password"
+                ref={passwordRef}
+                type={showPwd ? 'text' : 'password'}
+                autoComplete="current-password"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                required
+                placeholder="请输入管理员密码"
+              />
+              <button
+                type="button"
+                className="password-toggle"
+                aria-label={showPwd ? '隐藏密码' : '显示密码'}
+                onClick={() => setShowPwd((v) => !v)}
+                tabIndex={-1}
+              >
+                {showPwd ? <IconEyeOff size={15} /> : <IconEye size={15} />}
+              </button>
+            </div>
+          </div>
+
+          <button type="submit" className="primary login-submit" disabled={submitting || !password}>
             {submitting ? '登录中…' : '登录'}
           </button>
-        </div>
-      </form>
+        </form>
+      </div>
+
+      <p className="login-footnote">仅限授权管理员访问 · 会话仅保存在本机</p>
     </div>
   )
 }

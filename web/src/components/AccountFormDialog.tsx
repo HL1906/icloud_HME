@@ -5,7 +5,8 @@ import { request, ApiError } from '../api/client'
 interface AccountFormDialogProps {
   open: boolean
   onClose: () => void
-  onSaved: () => void
+  /** validating 为 true 表示账号已创建,凭据校验由服务端后台完成 */
+  onSaved: (info: { validating: boolean }) => void
   editing?: {
     id: string
     name: string
@@ -57,14 +58,17 @@ export default function AccountFormDialog({
           method: 'PATCH',
           body: JSON.stringify({ name, icloud_email: icloudEmail, host }),
         })
+        reset()
+        onSaved({ validating: false })
       } else {
         await request('/api/accounts', {
           method: 'POST',
           body: JSON.stringify({ name, icloud_email: icloudEmail, host, proxy, cookies }),
         })
+        const validating = cookies.trim() !== ''
+        reset()
+        onSaved({ validating })
       }
-      reset()
-      onSaved()
     } catch (err) {
       setError(err instanceof ApiError ? err.message : '网络连接失败，请检查服务状态')
     } finally {

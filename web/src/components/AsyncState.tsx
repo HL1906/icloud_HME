@@ -19,9 +19,10 @@ export default function AsyncState({
   onRetry,
   children,
 }: AsyncStateProps) {
+  // 三种状态都包一层 async-body,便于父容器(.data-panel)统一撑满高度
   if (loading) {
     return (
-      <div className="skeleton" role="status" aria-label="加载中" aria-busy="true">
+      <div className="skeleton async-body" role="status" aria-label="加载中" aria-busy="true">
         <span className="visually-hidden">加载中</span>
         <div className="skeleton-line" style={{ width: '30%' }} />
         <div className="skeleton-line" style={{ width: '85%' }} />
@@ -32,7 +33,7 @@ export default function AsyncState({
   }
   if (error) {
     return (
-      <div>
+      <div className="async-body">
         <div className="alert-error" role="alert" style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
           <IconAlert size={18} style={{ flexShrink: 0 }} />
           <span>{error}</span>
@@ -43,11 +44,13 @@ export default function AsyncState({
   }
   if (empty) {
     return (
-      <p className="empty-state">
-        <IconInboxEmpty className="empty-icon" />
-        {emptyText}
-      </p>
+      <div className="async-body">
+        <p className="empty-state">
+          <IconInboxEmpty className="empty-icon" />
+          {emptyText}
+        </p>
+      </div>
     )
   }
-  return <>{children}</>
+  return <div className="async-body">{children}</div>
 }

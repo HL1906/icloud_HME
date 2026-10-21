@@ -30,6 +30,8 @@ function renderApp(initialPath = '/accounts') {
         <Routes>
           <Route path="/login" element={<TestApp />} />
           <Route path="/accounts" element={<TestApp />} />
+          {/* 登录成功后默认进入总览看板 */}
+          <Route path="/dashboard" element={<TestApp />} />
         </Routes>
       </AuthProvider>
     </MemoryRouter>,
@@ -69,10 +71,10 @@ describe('AuthProvider + LoginPage', () => {
       ),
     )
     renderApp()
-    expect(await screen.findByRole('heading', { name: 'iCloud HME 管理台' })).toBeInTheDocument()
+    expect(await screen.findByRole('heading', { name: 'iCloud 隐藏邮箱管理台' })).toBeInTheDocument()
   })
 
-  it('登录成功进入 /accounts', async () => {
+  it('登录成功进入总览看板', async () => {
     server.use(
       http.get('/api/auth/session', () =>
         HttpResponse.json(
@@ -92,7 +94,7 @@ describe('AuthProvider + LoginPage', () => {
     )
     renderApp()
     const user = userEvent.setup()
-    await screen.findByRole('heading', { name: 'iCloud HME 管理台' })
+    await screen.findByRole('heading', { name: 'iCloud 隐藏邮箱管理台' })
     await user.type(screen.getByLabelText(/管理员密码/), 'admin-pass-2026')
     await user.click(screen.getByRole('button', { name: /登录/ }))
     expect(await screen.findByTestId('protected')).toBeInTheDocument()
@@ -115,7 +117,7 @@ describe('AuthProvider + LoginPage', () => {
     )
     renderApp()
     const user = userEvent.setup()
-    await screen.findByRole('heading', { name: 'iCloud HME 管理台' })
+    await screen.findByRole('heading', { name: 'iCloud 隐藏邮箱管理台' })
     await user.type(screen.getByLabelText(/管理员密码/), 'wrong-password')
     await user.click(screen.getByRole('button', { name: /登录/ }))
     const alert = await screen.findByRole('alert')
@@ -171,7 +173,7 @@ describe('AuthProvider + LoginPage', () => {
     await screen.findByTestId('protected')
     await user.click(screen.getByRole('button', { name: /退出登录/ }))
     await waitFor(() =>
-      expect(screen.getByRole('heading', { name: 'iCloud HME 管理台' })).toBeInTheDocument(),
+      expect(screen.getByRole('heading', { name: 'iCloud 隐藏邮箱管理台' })).toBeInTheDocument(),
     )
   })
 })

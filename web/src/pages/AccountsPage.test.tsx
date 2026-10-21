@@ -67,6 +67,17 @@ function renderPage() {
   )
 }
 
+/**
+ * 点击行「更多」菜单里的操作。
+ * 菜单通过 portal 渲染到 document.body,所以直接从 body 查询。
+ */
+async function clickInMoreMenu(user: ReturnType<typeof userEvent.setup>, name: RegExp) {
+  const triggers = screen.getAllByRole('button', { name: /更多操作/ })
+  await user.click(triggers[0])
+  const item = await screen.findByRole('button', { name })
+  await user.click(item)
+}
+
 describe('AccountsPage', () => {
   beforeEach(() => {
     setCSRFToken('csrf-test')
@@ -173,7 +184,7 @@ describe('AccountsPage', () => {
     renderPage()
     await screen.findByText('活跃号')
     const user = userEvent.setup()
-    await user.click(screen.getAllByRole('button', { name: /iCloud 登录/ })[0])
+    await clickInMoreMenu(user, /iCloud 登录/)
     await user.type(screen.getByLabelText(/密码/), 'p@ssw0rd')
     let dialog = screen.getByRole('dialog')
     await user.click(within(dialog).getByRole('button', { name: /登录/ }))
@@ -198,7 +209,8 @@ describe('AccountsPage', () => {
     renderPage()
     await screen.findByText('活跃号')
     const user = userEvent.setup()
-    await user.click(screen.getAllByRole('button', { name: /设置 App 密码/ })[0])
+    // 「App 密码」现在固定在行内显示
+    await user.click(screen.getAllByRole('button', { name: /^App 密码$/ })[0])
     await user.type(screen.getByLabelText(/邮箱/), 'app@icloud.com')
     await user.type(screen.getByLabelText('App 专用密码'), 'xxxx-xxxx-xxxx-xxxx')
     await user.click(screen.getByRole('button', { name: /保存/ }))
@@ -220,7 +232,8 @@ describe('AccountsPage', () => {
     renderPage()
     await screen.findByText('活跃号')
     const user = userEvent.setup()
-    await user.click(screen.getAllByRole('button', { name: /设置代理/ })[0])
+    // 「设置代理」收在「更多」菜单里,需要先展开
+    await clickInMoreMenu(user, /设置代理/)
     const input = screen.getByLabelText(/代理地址/) as HTMLInputElement
     expect(input.value).toBe('')
     await user.type(input, 'http://u:p@proxy.example.com:8080')
@@ -229,7 +242,7 @@ describe('AccountsPage', () => {
     await waitFor(() => expect(input.value).toBe(''))
     // 关闭后重新打开:仍为空(从不回显)
     await user.click(screen.getByRole('button', { name: /取消/ }))
-    await user.click(screen.getAllByRole('button', { name: /设置代理/ })[0])
+    await clickInMoreMenu(user, /设置代理/)
     expect((screen.getByLabelText(/代理地址/) as HTMLInputElement).value).toBe('')
   })
 
@@ -245,7 +258,7 @@ describe('AccountsPage', () => {
     renderPage()
     await screen.findByText('活跃号')
     const user = userEvent.setup()
-    await user.click(screen.getAllByRole('button', { name: /删除/ })[0])
+    await clickInMoreMenu(user, /删除/)
     expect(screen.getByRole('dialog')).toBeInTheDocument()
     // 名称不匹配时按钮禁用
     await user.type(screen.getByLabelText(/输入账号名称/), '错误名称')
@@ -253,5 +266,28 @@ describe('AccountsPage', () => {
     // 取消不发请求
     await user.click(screen.getByRole('button', { name: /取消/ }))
     expect(deleted).toBe(false)
+  })
+
+  it('后台校验中显示「校验中」,轮询拿到结果后自动刷新', async () => {
+    const validating: AccountSummary = {
+      ...accounts[0],
+      id: 'acc_validating',
+      name: '校验号',
+      status: 'validating',
+      status_message: '正在校验凭据…',
+    }
+    let listData: AccountSummary[] = [validating]
+    server.use(
+      http.get('/api/accounts', () => HttpResponse.json({ success: true, data: listData })),
+    )
+    renderPage()
+    expect(await screen.findByText('校验号')).toBeInTheDocument()
+    expect(screen.getByText('校验中')).toBeInTheDocument()
+
+    // 服务端校验完成:轮询(2s)应把状态刷成正常,无需用户手动刷新
+    listData = [{ ...validating, status: 'active', status_message: '' }]
+    await waitFor(() => expect(screen.getByText('正常')).toBeInTheDocument(), {
+      timeout: 5000,
+    })
   })
 })

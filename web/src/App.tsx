@@ -3,6 +3,7 @@ import { AuthProvider, useAuth } from './auth/AuthProvider'
 import { ToastProvider } from './components/ToastProvider'
 import AppShell from './components/AppShell'
 import LoginPage from './pages/LoginPage'
+import DashboardPage from './pages/DashboardPage'
 import AccountsPage from './pages/AccountsPage'
 import AliasesPage from './pages/AliasesPage'
 import InboxPage from './pages/InboxPage'
@@ -26,10 +27,11 @@ export default function App() {
           <Routes>
             <Route path="/login" element={<LoginPage />} />
             <Route element={<ProtectedLayout />}>
+              <Route path="/dashboard" element={<DashboardPage />} />
               <Route path="/accounts" element={<AccountsPage />} />
               <Route path="/aliases" element={<AliasesPage />} />
               <Route path="/inbox" element={<InboxPage />} />
-              <Route path="*" element={<Navigate to="/accounts" replace />} />
+              <Route path="*" element={<Navigate to="/dashboard" replace />} />
             </Route>
           </Routes>
         </ToastProvider>
