@@ -32,7 +32,10 @@ type WebClient struct {
 }
 
 // NewWebClient 创建一个 Web 邮件客户端。
-func NewWebClient(cookies map[string]string, dsid, host string) *WebClient {
+//
+// 构造失败必须回传给调用方:忽略错误会得到一个 httpc 为 nil 的客户端,
+// 后续请求会以空指针 panic 的形式失败,远比一个明确错误难排查。
+func NewWebClient(cookies map[string]string, dsid, host string) (*WebClient, error) {
 	jar := tls_client.NewCookieJar()
 	options := []tls_client.HttpClientOption{
 		tls_client.WithTimeoutSeconds(30),
@@ -41,7 +44,10 @@ func NewWebClient(cookies map[string]string, dsid, host string) *WebClient {
 		tls_client.WithNotFollowRedirects(),
 	}
 
-	httpc, _ := tls_client.NewHttpClient(tls_client.NewNoopLogger(), options...)
+	httpc, err := tls_client.NewHttpClient(tls_client.NewNoopLogger(), options...)
+	if err != nil {
+		return nil, fmt.Errorf("创建 Web 邮件客户端失败: %w", err)
+	}
 
 	if host == "" {
 		host = "icloud.com"
@@ -81,7 +87,7 @@ func NewWebClient(cookies map[string]string, dsid, host string) *WebClient {
 		}
 	}
 
-	return c
+	return c, nil
 }
 
 // origin 返回当前账号对应的 Web Origin。
@@ -170,6 +176,7 @@ type threadSearchResp struct {
 		ThreadID  string   `json:"threadId"`
 		Subject   string   `json:"subject"`
 		Senders   []string `json:"senders"`
+		Receivers []string `json:"receivers"` // 收件人(即投递到哪个 HME 别名),别名过滤依赖此字段
 		Preview   string   `json:"preview"`
 		Timestamp int64    `json:"timestamp"`
 	} `json:"threadList"`
@@ -220,6 +227,7 @@ func (c *WebClient) search(payload string) ([]Message, error) {
 		messages = append(messages, Message{
 			ID:      t.ThreadID,
 			From:    from,
+			To:      strings.Join(t.Receivers, ", "),
 			Subject: t.Subject,
 			Preview: sanitizePreview(t.Preview),
 			Date:    date,
@@ -245,6 +253,10 @@ func (c *WebClient) SearchMails(query string, limit int) ([]Message, error) {
 
 // FindByAlias 查找发给指定别名的邮件——在本地过滤(Web API 不支持收件人搜索)。
 func (c *WebClient) FindByAlias(alias string, limit int) ([]Message, error) {
+	alias = strings.ToLower(strings.TrimSpace(alias))
+	if alias == "" {
+		return c.ListInbox(limit)
+	}
 	// 拉取收件箱全部邮件(最多取 2*limit),本地过滤
 	batchSize := limit * 2
 	if batchSize < 50 {
@@ -255,12 +267,12 @@ func (c *WebClient) FindByAlias(alias string, limit int) ([]Message, error) {
 		return nil, err
 	}
 
-	// 本地过滤: To/CC/BCC 或主题中包含 alias
+	// 本地过滤: 只认收件人(To)。
+	// 注意: 不能拿 From/Subject 做匹配——那会把"发件人恰好是别名"或
+	// "主题里提到别名"的无关邮件也算进来,导致转发服务串号。
 	filtered := make([]Message, 0, limit)
 	for _, m := range raw {
-		if strings.Contains(strings.ToLower(m.Subject), strings.ToLower(alias)) ||
-			strings.Contains(strings.ToLower(m.From), strings.ToLower(alias)) ||
-			strings.Contains(strings.ToLower(m.To), strings.ToLower(alias)) {
+		if recipientMatches(m.To, alias) {
 			filtered = append(filtered, m)
 			if len(filtered) >= limit {
 				break
@@ -268,6 +280,137 @@ func (c *WebClient) FindByAlias(alias string, limit int) ([]Message, error) {
 		}
 	}
 	return filtered, nil
+}
+
+// recipientMatches 判断收件人字段中是否包含指定别名(大小写不敏感,按地址边界匹配)。
+func recipientMatches(to, alias string) bool {
+	to = strings.ToLower(to)
+	if to == "" || alias == "" {
+		return false
+	}
+	// 收件人可能是 "a@icloud.com, b@icloud.com",逐个比较避免子串误命中
+	for _, part := range strings.Split(to, ",") {
+		part = strings.TrimSpace(part)
+		// 去掉 "显示名 <addr>" 形式的外壳
+		if i := strings.LastIndex(part, "<"); i >= 0 {
+			part = strings.TrimSuffix(strings.TrimSpace(part[i+1:]), ">")
+		}
+		if part == alias {
+			return true
+		}
+	}
+	return false
+}
+
+// messageBatchResp 是 message/batch 接口的响应结构(threadId → 具体邮件列表)。
+type messageBatchResp struct {
+	Messages []webMessage `json:"messages"`
+}
+
+// webMessage 是 Web API 返回的单封邮件。
+type webMessage struct {
+	ID        string `json:"id"`
+	ThreadID  string `json:"threadId"`
+	Subject   string `json:"subject"`
+	Sender    string `json:"sender"`
+	From      string `json:"from"`
+	To        string `json:"to"`
+	Timestamp int64  `json:"timestamp"`
+	Preview   string `json:"preview"`
+	Body      string `json:"body"`
+	Content   string `json:"content"`
+}
+
+// GetFull 通过 Web API 获取单封邮件的完整内容(含正文)。
+// threadID 即 ListInbox 返回的 Message.ID。
+func (c *WebClient) GetFull(threadID string) (*FullMessage, error) {
+	if strings.TrimSpace(threadID) == "" {
+		return nil, fmt.Errorf("邮件 ID 无效")
+	}
+	if err := c.resolveMccGateway(); err != nil {
+		return nil, err
+	}
+
+	payload := fmt.Sprintf(`{"threadId":%q,"sessionHeaders":{"folder":"INBOX","condstore":1,"qresync":1}}`, threadID)
+	url := c.withParams(c.mccGatewayURL + "/mailws2/v1/message/batch")
+	req, err := http.NewRequest("POST", url, strings.NewReader(payload))
+	if err != nil {
+		return nil, err
+	}
+	c.setCommonHeaders(req)
+
+	resp, err := c.httpc.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("获取邮件详情失败: HTTP %d - %s", resp.StatusCode, truncate(string(body), 300))
+	}
+	if strings.Contains(string(body), `"success":false`) {
+		return nil, fmt.Errorf("获取邮件详情失败: %s", truncate(string(body), 300))
+	}
+
+	msgs, err := parseWebMessages(body)
+	if err != nil {
+		return nil, err
+	}
+	if len(msgs) == 0 {
+		return nil, fmt.Errorf("邮件不存在 (threadId=%s)", threadID)
+	}
+
+	// 一个 thread 可能有多封往来,取最新一封作为"详情"
+	latest := msgs[len(msgs)-1]
+	for _, m := range msgs {
+		if m.Timestamp > latest.Timestamp {
+			latest = m
+		}
+	}
+
+	full := &FullMessage{Message: Message{ID: threadID}}
+	full.From = firstNonEmpty(latest.Sender, latest.From)
+	full.To = latest.To
+	full.Subject = latest.Subject
+	if latest.Timestamp > 0 {
+		full.Date = time.UnixMilli(latest.Timestamp).Format(time.RFC3339)
+	}
+	text := firstNonEmpty(latest.Body, latest.Content, latest.Preview)
+	full.Body = sanitizePreview(text)
+	full.Preview = sanitizePreview(latest.Preview)
+	if strings.Contains(strings.ToLower(latest.Content), "<") {
+		full.ContentType = "text/html"
+	} else {
+		full.ContentType = "text/plain"
+	}
+	return full, nil
+}
+
+// parseWebMessages 解析 message/batch 响应,兼容单封与数组两种外层结构。
+func parseWebMessages(raw []byte) ([]webMessage, error) {
+	var batch messageBatchResp
+	if err := json.Unmarshal(raw, &batch); err == nil && len(batch.Messages) > 0 {
+		return batch.Messages, nil
+	}
+	var list []webMessage
+	if err := json.Unmarshal(raw, &list); err == nil && len(list) > 0 {
+		return list, nil
+	}
+	var single webMessage
+	if err := json.Unmarshal(raw, &single); err == nil && (single.ID != "" || single.Subject != "") {
+		return []webMessage{single}, nil
+	}
+	return nil, fmt.Errorf("解析邮件详情响应失败")
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, v := range values {
+		if strings.TrimSpace(v) != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 func truncate(s string, n int) string {

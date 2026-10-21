@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -252,5 +253,47 @@ func TestManagerBadReader(t *testing.T) {
 	}
 	if _, err := NewManager(opts); err == nil {
 		t.Fatal("随机源失败时构造器应报错")
+	}
+}
+
+// TestManagerConcurrentLoginAndChangePassword 验证登录与改密并发时不会读写竞争。
+//
+// 该用例在 `go test -race` 下才能检测数据竞争;普通运行下至少保证
+// 不 panic、不出现"旧密码改密后仍可登录"的情况。
+func TestManagerConcurrentLoginAndChangePassword(t *testing.T) {
+	m := newTestManager(t)
+	const oldPw, newPw = "admin-pass-2026-strong", "admin-pass-2026-strong-2"
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+					_, _, _ = m.Login(oldPw)
+					_, _ = m.Validate("nonexistent-session")
+					_ = m.ValidateCSRF("nonexistent-session", "token")
+				}
+			}
+		}()
+	}
+
+	if err := m.ChangePassword(oldPw, newPw, ""); err != nil {
+		t.Fatalf("改密失败: %v", err)
+	}
+	close(stop)
+	wg.Wait()
+
+	// 改密后旧密码必须失效、新密码必须可用
+	if _, _, ok := m.Login(oldPw); ok {
+		t.Fatal("改密后旧密码不应能登录")
+	}
+	if _, _, ok := m.Login(newPw); !ok {
+		t.Fatal("改密后新密码应能登录")
 	}
 }

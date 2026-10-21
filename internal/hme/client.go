@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	http "github.com/bogdanfinn/fhttp"
@@ -63,6 +64,10 @@ type Alias struct {
 //
 // 一个 Client 对应一个 iCloud 账号。通过传入的 Cookie 维持会话,
 // 首次调用业务方法时会自动触发 ValidateSession 解析 HME 服务端点。
+//
+// 并发说明:内部对 Cookies 加了读写锁,允许一个请求更新 Cookie 时
+// 另一个 goroutine 读取快照;但 serviceURL/dsid 等会话状态仍是懒加载,
+// 因此同一个 Client 上的**业务调用**建议串行(上层每请求新建 Client)。
 type Client struct {
 	Cookies     map[string]string
 	Host        string // "icloud.com" 或 "icloud.com.cn"
@@ -76,6 +81,68 @@ type Client struct {
 	dsid        string // 从 validate 响应提取
 	clientID    string // UUID,每次会话生成
 	accountInfo *AccountInfo
+	// mu 保护 Cookies(iCloud 会在响应里通过 Set-Cookie 刷新 token)
+	mu sync.RWMutex
+}
+
+// CookieSnapshot 返回 Cookie 的独立副本,调用方可安全持有与遍历。
+func (c *Client) CookieSnapshot() map[string]string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	out := make(map[string]string, len(c.Cookies))
+	for k, v := range c.Cookies {
+		out[k] = v
+	}
+	return out
+}
+
+// replaceCookies 整体替换 Cookie(登录成功后用)。
+func (c *Client) replaceCookies(cookies map[string]string) {
+	if cookies == nil {
+		cookies = make(map[string]string)
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.Cookies = cookies
+}
+
+// setCookie 记录响应里刷新出来的单个 Cookie。
+func (c *Client) setCookie(name, value string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.Cookies == nil {
+		c.Cookies = make(map[string]string)
+	}
+	c.Cookies[name] = value
+}
+
+// prepareCookies 生成请求用的 Cookie 头,并把同一份快照同步进 cookie jar。
+//
+// 浏览器发送的 Cookie 值带双引号,iCloud 严格匹配,否则会返回 401。
+// 同步 jar 的目的是避免 jar 里残留的旧值再被附加一次——同名 Cookie
+// 出现两个不同值时,服务端按第一个解析,行为不可控。
+func (c *Client) prepareCookies(rawURL string) string {
+	c.mu.RLock()
+	if len(c.Cookies) == 0 {
+		c.mu.RUnlock()
+		return ""
+	}
+	parts := make([]string, 0, len(c.Cookies))
+	jarCookies := make([]*http.Cookie, 0, len(c.Cookies))
+	for k, v := range c.Cookies {
+		value := v
+		if !strings.HasPrefix(value, `"`) {
+			value = `"` + value + `"`
+		}
+		parts = append(parts, k+"="+value)
+		jarCookies = append(jarCookies, &http.Cookie{Name: k, Value: v, Path: "/"})
+	}
+	c.mu.RUnlock()
+
+	if u, err := url.Parse(rawURL); err == nil && u.Host != "" {
+		c.httpc.SetCookies(u, jarCookies)
+	}
+	return strings.Join(parts, "; ")
 }
 
 // NewClient 创建一个新的 HME 客户端,底层使用 Chrome TLS 指纹。
@@ -106,7 +173,7 @@ func NewClient(cookies map[string]string, host, proxy string, verbose bool) (*Cl
 	}
 
 	c := &Client{
-		Cookies:  cookies,
+		Cookies:  cloneCookieMap(cookies),
 		Host:     normalizeHost(host),
 		Proxy:    proxy,
 		Verbose:  verbose,
@@ -184,6 +251,14 @@ func (c *Client) log(format string, args ...any) {
 	if c.Verbose {
 		fmt.Printf("  [iCloud] %s\n", fmt.Sprintf(format, args...))
 	}
+}
+
+// redactURL 去掉 URL 中的查询串,避免把 dsid 等会话标识写进日志。
+func redactURL(raw string) string {
+	if i := strings.IndexByte(raw, '?'); i >= 0 {
+		return raw[:i] + "?..."
+	}
+	return raw
 }
 
 // buildURL 给 URL 追加 clientBuildNumber / clientMasteringNumber / clientId / dsid 查询参数,
@@ -280,26 +355,15 @@ func (c *Client) request(method, rawURL string, body any, timeout time.Duration,
 		req.Header.Set("sec-ch-ua-platform", `"Windows"`)
 		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36")
 
-		// 手动添加 Cookie 头（确保跨域也能传递）
-		// 浏览器发送的 Cookie 值带双引号,iCloud 严格匹配
-		if len(c.Cookies) > 0 {
-			cookieParts := make([]string, 0, len(c.Cookies))
-			for k, v := range c.Cookies {
-				if strings.HasPrefix(v, `"`) {
-					cookieParts = append(cookieParts, k+"="+v)
-				} else {
-					cookieParts = append(cookieParts, k+`="`+v+`"`)
-				}
-			}
-			cookieHeader := strings.Join(cookieParts, "; ")
+		// 手动添加 Cookie 头(确保跨域也能传递),并同步刷新 cookie jar
+		if cookieHeader := c.prepareCookies(fullURL); cookieHeader != "" {
 			req.Header.Set("Cookie", cookieHeader)
 			if c.Verbose {
-				c.log(">>> URL: %s", fullURL)
-				c.log(">>> Cookie: %s", cookieHeader[:min(200, len(cookieHeader))])
-				for k, vv := range req.Header {
-					for _, v := range vv {
-						c.log(">>> %s: %s", k, v[:min(100, len(v))])
-					}
+				// 只打印 URL 与请求头名称;Cookie / 认证类头的值一律不落日志,
+				// 否则 docker logs / systemd journal 的读者可直接接管账号。
+				c.log(">>> URL: %s", redactURL(fullURL))
+				for k := range req.Header {
+					c.log(">>> 请求头: %s", k)
 				}
 			}
 		}
@@ -320,7 +384,7 @@ func (c *Client) request(method, rawURL string, body any, timeout time.Duration,
 		// 从 Set-Cookie 响应头更新 Cookie（模拟浏览器行为,iCloud 会刷新 token）
 		for _, sc := range resp.Cookies() {
 			if sc.Name != "" && sc.Value != "" {
-				c.Cookies[sc.Name] = sc.Value
+				c.setCookie(sc.Name, sc.Value)
 			}
 		}
 
@@ -377,9 +441,10 @@ func (c *Client) validationURLs() []string {
 // 失败通常意味着 Cookie 过期或未订阅 iCloud+。
 func (c *Client) ValidateSession() error {
 	c.log("校验 iCloud 会话...")
-	c.log("使用的 Cookie 数量: %d", len(c.Cookies))
-	if len(c.Cookies) > 0 {
-		for k := range c.Cookies {
+	cookies := c.CookieSnapshot()
+	c.log("使用的 Cookie 数量: %d", len(cookies))
+	if len(cookies) > 0 {
+		for k := range cookies {
 			c.log("Cookie: %s", k)
 		}
 	}
@@ -416,21 +481,8 @@ func (c *Client) ValidateSession() error {
 		c.serviceURL = strings.TrimSuffix(c.serviceURL, ":443")
 	}
 
-	// 获取 serviceURL 后，再次设置 Cookie 到该域名
-	if len(c.Cookies) > 0 {
-		u, _ := url.Parse(c.serviceURL)
-		httpCookies := make([]*http.Cookie, 0, len(c.Cookies))
-		for k, v := range c.Cookies {
-			httpCookies = append(httpCookies, &http.Cookie{
-				Name:  k,
-				Value: v,
-				Path:  "/",
-			})
-		}
-		c.httpc.GetCookies(u) // 触发 cookie jar 初始化
-		// 注意：需要手动设置 cookie，但 tls-client 的 CookieJar 不支持直接设置
-		// 我们需要在请求时手动添加 Cookie 头
-	}
+	// serviceURL 解析完成后,cookie jar 会在下一次请求由 prepareCookies
+	// 按实际目标 URL 同步,这里无需再做额外处理。
 
 	dsInfo := data.Get("dsInfo")
 	c.dsid = dsInfo.Get("dsid").String()
@@ -442,8 +494,9 @@ func (c *Client) ValidateSession() error {
 		IsManagedAppleID: dsInfo.Get("isManagedAppleId").Bool(),
 	}
 	if info.AppleID == "" {
+		cookies := c.CookieSnapshot()
 		for _, name := range []string{"aosappleid", "appleId", "dsid"} {
-			if v, ok := c.Cookies[name]; ok && v != "" {
+			if v, ok := cookies[name]; ok && v != "" {
 				info.AppleID = v
 				break
 			}
@@ -732,6 +785,18 @@ func findFirstDictArray(v gjson.Result) gjson.Result {
 }
 
 // ---- 小工具 ----
+
+// cloneCookieMap 返回 Cookie map 的独立副本。
+func cloneCookieMap(cookies map[string]string) map[string]string {
+	if cookies == nil {
+		return make(map[string]string)
+	}
+	out := make(map[string]string, len(cookies))
+	for k, v := range cookies {
+		out[k] = v
+	}
+	return out
+}
 
 func firstNonEmpty(vals ...string) string {
 	for _, v := range vals {

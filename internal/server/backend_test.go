@@ -35,6 +35,7 @@ type fakeBackend struct {
 	loginErr     error
 	removedID    string
 	removedOK    bool
+	removeErr    error
 
 	aliasActID     string
 	aliasActActive bool
@@ -43,6 +44,19 @@ type fakeBackend struct {
 	aliasDeleteErr error
 	listInboxQuery InboxQuery
 	reloadCount    int
+
+	gotMessageID     string
+	deletedMessageID string
+	deleteMessageErr error
+
+	forwardQuery   ForwardQuery
+	forwardResult  ForwardResult
+	forwardErr     error
+	ackedAccountID string
+	ackedAlias     string
+	ackedIDs       []string
+	ackedForwarded bool
+	ackErr         error
 }
 
 func (f *fakeBackend) ListAccounts() []account.Summary { return f.accounts }
@@ -102,9 +116,9 @@ func (f *fakeBackend) LoginAccount(id, password, otp string) (account.Summary, e
 	return f.accounts[0], nil
 }
 
-func (f *fakeBackend) RemoveAccount(id string) bool {
+func (f *fakeBackend) RemoveAccount(id string) (bool, error) {
 	f.removedID = id
-	return f.removedOK
+	return f.removedOK, f.removeErr
 }
 
 func (f *fakeBackend) CreateAlias(accountID, label string) (*hme.CreateResult, error) {
@@ -130,11 +144,28 @@ func (f *fakeBackend) ListInbox(q InboxQuery) (InboxResult, error) {
 	return f.inbox, nil
 }
 
-func (f *fakeBackend) GetMessage(accountID string, uid uint32) (*mail.FullMessage, error) {
-	return &mail.FullMessage{Message: mail.Message{ID: fmt.Sprint(uid)}}, nil
+func (f *fakeBackend) GetMessage(accountID, messageID string) (*mail.FullMessage, error) {
+	f.gotMessageID = messageID
+	return &mail.FullMessage{Message: mail.Message{ID: messageID}}, nil
 }
 
-func (f *fakeBackend) DeleteMessage(accountID string, uid uint32) error { return nil }
+func (f *fakeBackend) DeleteMessage(accountID, messageID string) error {
+	f.deletedMessageID = messageID
+	return f.deleteMessageErr
+}
+
+func (f *fakeBackend) FetchForForward(q ForwardQuery) (ForwardResult, error) {
+	f.forwardQuery = q
+	if f.forwardErr != nil {
+		return ForwardResult{}, f.forwardErr
+	}
+	return f.forwardResult, nil
+}
+
+func (f *fakeBackend) MarkForwarded(accountID, alias string, ids []string, forwarded bool) (int, error) {
+	f.ackedAccountID, f.ackedAlias, f.ackedIDs, f.ackedForwarded = accountID, alias, ids, forwarded
+	return len(ids), f.ackErr
+}
 
 func (f *fakeBackend) Reload() error {
 	f.reloadCount++
@@ -148,9 +179,23 @@ func newTestServer(f *fakeBackend) (*Server, *httptest.Server) {
 		AdminPassword: "admin-pass-2026-strong",
 		SessionTTL:    12 * time.Hour,
 	}
-	s := newWithBackend(f, cfg)
+	s, err := newWithBackend(f, cfg)
+	if err != nil {
+		// 固定密码合法,走到这里说明测试配置有误
+		panic(fmt.Sprintf("newWithBackend: %v", err))
+	}
 	ts := httptest.NewServer(s.Handler())
 	return s, ts
+}
+
+// mustServer 构造 Server,失败即终止测试(供各测试文件复用)。
+func mustServer(t *testing.T, be Backend, cfg Config) *Server {
+	t.Helper()
+	s, err := newWithBackend(be, cfg)
+	if err != nil {
+		t.Fatalf("newWithBackend: %v", err)
+	}
+	return s
 }
 
 // login 登录测试服务并返回 session Cookie 与 CSRF。

@@ -13,7 +13,9 @@
 - ✅ **双路径读信** — 邮件读取优先走 IMAP (App Password),无 App Password 时回退 Web API (Cookie)
 - ✅ **多账号管理** — 支持多个 iCloud 账号并行管理
 - ✅ **双认证模式** — Cookie (创建别名 + 读邮件回退) 和 App Password (IMAP 优先)
-- ✅ **安全模型** — 单管理员会话、CSRF 校验、登录限流、响应脱敏
+- ✅ **转发服务接口** — 按别名拉取「待转发」新邮件并登记已转发，避免重复转发
+- ✅ **分发总览看板** — 隐藏邮箱总数、启用/停用、账号状态与最近创建一屏掌握
+- ✅ **安全模型** — 单管理员会话、CSRF 校验、登录限流、SSRF 防护、响应脱敏
 
 ## 快速开始
 
@@ -79,10 +81,15 @@ go build -o icloud-hme .
 
 | 环境变量 | 说明 | 默认 |
 |---|---|---|
-| `ICLOUD_HME_ADMIN_PASSWORD` | 管理员密码，**必填**，至少 8 字符 | 无（缺失时拒绝启动） |
+| `ICLOUD_HME_ADMIN_PASSWORD` | 管理员初始密码，至少 8 字符 | 首次启动必填；已改过密码后可不设 |
 | `ICLOUD_HME_SESSION_TTL` | 会话有效期 | `12h`（范围 `15m`–`168h`） |
 | `ICLOUD_HME_SECURE_COOKIE` | 通过 TLS 反向代理部署时设为 `true` | `false` |
 
+> **关于密码**：首次启动用环境变量初始化，密码经 argon2id 加盐派生后写入
+> `data/admin_credential.json`（仅存哈希，权限 0600）。
+> 之后可在界面左下角「修改密码」随时更换，**重启不会丢失**；
+> 一旦改过密码，环境变量不再生效，以文件为准。
+>
 > **Breaking Change（v0.3+）**：升级后未设置 `ICLOUD_HME_ADMIN_PASSWORD` 将拒绝启动；
 > 原有匿名 API 调用将收到 `401 AUTH_REQUIRED`。管理员会话只存内存，进程重启即失效。
 
@@ -197,6 +204,39 @@ GET /api/inbox?account_id=acc_1&alias=xyz123@icloud.com&limit=20&days=7
 #   method: "imap"    — 通过 App Password 认证 (优先)
 #   method: "web_api" — 通过 Cookie 认证,无需 App Password (回退)
 ```
+
+#### 转发服务接口（按别名取待转发邮件）
+
+面向「隐藏邮箱分发给多人、再由服务按别名转发」的场景：
+
+```bash
+# 1. 只拉取尚未转发的邮件(alias 必填)
+GET /api/forward?account_id=acc_1&alias=xyz123@icloud.com&limit=20&days=7&include_body=1
+
+# 响应
+{
+  "success": true,
+  "data": {
+    "account_id": "acc_1",
+    "alias": "xyz123@icloud.com",
+    "count": 1,
+    "method": "imap",
+    "messages": [
+      {"id": "1042", "subject": "欢迎注册", "forwarded": false, "body": "…"}
+    ]
+  }
+}
+
+# 2. 转发成功后登记,下次轮询不再返回这批邮件
+POST /api/forward/ack
+{"account_id": "acc_1", "alias": "xyz123@icloud.com", "ids": ["1042"]}
+
+# 响应
+{"success": true, "data": {"account_id": "acc_1", "alias": "xyz123@icloud.com", "updated": 1, "forwarded": true}}
+```
+
+`forwarded: false` 可取消标记（转发失败需重试时用）。标记持久化在数据目录的 `forwarded.json`，
+按「账号 + 别名 + 邮件 ID」去重，别名大小写不敏感。
 
 ### 账号管理接口
 
@@ -447,6 +487,32 @@ App Password 用于 IMAP 读取邮件,是邮件读取的优先路径 (支持服�
 2. **回退: Web API (Cookie)** — 无 App Password 或 IMAP 失败时,通过 `mccgateway` 端点读取,本地按别名过滤
 
 响应中包含 `"method": "web_api"` 或 `"method": "imap"` 字段,标识实际使用的读取方式。
+
+## 安全说明
+
+### 已实施的防护
+
+| 风险 | 防护措施 |
+|---|---|
+| **SSRF**（自定义收件邮箱可指向内网） | 拨号层地址校验（`internal/netsafe`）：拒绝回环/私有/CGNAT/链路本地/云元数据地址，端口白名单 993/143/1993/2993；DNS 解析后的每个 IP 都校验 |
+| **登录爆破 / 全站锁定** | 按 IP 限流 + 全局失败上限；**密码正确时不受限流影响**，避免有人刷错密码把管理员一起锁在门外 |
+| **CSRF** | 服务端存储的 per-session token（常量时间比较）+ 请求头；另校验 `Origin` 与 Host 同源 |
+| **凭据泄露到日志** | verbose 模式不再打印 Cookie 值与请求头值；URL 只打印到 `?` 前 |
+| **会话安全** | CSPRNG 32 字节 token、内存只存 SHA-256、`HttpOnly` + `SameSite=Strict`、TTL 过期即清理、上限防内存增长 |
+| **口令存储** | argon2id(64 MiB) + 随机 salt，登录用常量时间比较；密码长度上限 1024 字节 |
+| **超大请求** | 请求体上限 1 MiB；`ReadHeaderTimeout`/`ReadTimeout`/`WriteTimeout`/`MaxHeaderBytes` 齐全，抗 Slowloris |
+| **越权取邮件** | 转发接口校验 alias 必须属于该账号，防止按别人的别名取 OTP |
+| **响应头** | CSP（`object-src 'none'`、`frame-ancestors 'none'`）、`X-Frame-Options: DENY`、`nosniff`、`Referrer-Policy`、COOP/CORP；TLS 部署时自动加 HSTS |
+| **数据落盘** | `accounts.json` / `forwarded.json` 原子写（临时文件 + fsync + rename），权限 0600，数据目录 0700 |
+| **日志隐私** | 访问日志不记录 query string（避免把别名写进日志） |
+| **邮件内容渲染** | 后端剥离 HTML/CSS，前端以文本节点渲染；无 `dangerouslySetInnerHTML` |
+
+### 部署注意
+
+- 生产环境请放在 TLS 反向代理后，并设置 `ICLOUD_HME_SECURE_COOKIE=true`（启用 Secure Cookie 与 HSTS）。
+- 管理员密码建议 16 字符以上随机串；会话只存内存，重启即失效。
+- 受限于「单管理员」模型，请勿直接把 8081 暴露到公网。
+- **本地自建 IMAP 测试**：SSRF 防护默认禁止内网地址。若确实需要连接内网的收件邮箱服务器，需在代码中显式放开（`netsafe.Policy{AllowPrivate: true}`）。
 
 ## 项目架构
 

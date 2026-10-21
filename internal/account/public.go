@@ -51,6 +51,8 @@ func (a *Account) Summary() Summary {
 		s.Mailbox = &MailboxSummary{Provider: a.Mailbox.Provider, Email: a.Mailbox.Email, IMAPHost: a.Mailbox.IMAPHost, IMAPPort: a.Mailbox.IMAPPort}
 	}
 	switch a.Status {
+	case "validating":
+		s.StatusMessage = "正在校验凭据…"
 	case "pending":
 		s.StatusMessage = "等待配置或验证凭据"
 	case "error":

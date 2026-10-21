@@ -12,16 +12,24 @@
 package server
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"io/fs"
+	"log"
 	"net/http"
+	"os"
+	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"icloud-hme/internal/account"
 	"icloud-hme/internal/auth"
+	"icloud-hme/internal/forward"
 	"icloud-hme/internal/webui"
 )
 
@@ -31,6 +39,8 @@ type Config struct {
 	AdminPassword string
 	SessionTTL    time.Duration
 	SecureCookie  bool
+	// DataDir 是持久化目录(转发标记等)。为空时使用当前目录。
+	DataDir string
 }
 
 // Server 封装 Gin 引擎、账号后端与认证。
@@ -44,40 +54,114 @@ type Server struct {
 
 // New 创建 Server。mgr 为账号管理器,cfg 为安全配置。
 func New(mgr *account.Manager, cfg Config) (*Server, error) {
-	if _, err := auth.NewManager(auth.Options{
-		Password: cfg.AdminPassword,
-		TTL:      cfg.SessionTTL,
-	}); err != nil {
-		return nil, err
+	be := &managerBackend{mgr: mgr}
+	// 转发标记存储不可用不应阻止启动,降级为"不去重";
+	// 但必须留日志,否则转发会静默重复推送。
+	if store, err := forward.NewStore(cfg.DataDir); err == nil {
+		be.forward = store
+	} else {
+		log.Printf("[server] 转发标记存储不可用,转发去重已禁用: %v", err)
 	}
-	return newWithBackend(&managerBackend{mgr: mgr}, cfg), nil
+	return newWithBackend(be, cfg)
+}
+
+// credentialFile 返回密码凭据的持久化路径(为空表示不持久化)。
+func (c Config) credentialFile() string {
+	if c.DataDir == "" {
+		return ""
+	}
+	return filepath.Join(c.DataDir, "admin_credential.json")
 }
 
 // newWithBackend 创建 Server 并注入 Backend(测试使用内存 fake)。
-func newWithBackend(be Backend, cfg Config) *Server {
+func newWithBackend(be Backend, cfg Config) (*Server, error) {
 	if !cfg.Debug {
 		gin.SetMode(gin.ReleaseMode)
 	}
 	s := &Server{
 		be:      be,
-		limiter: auth.NewLimiter(nil, 15*time.Minute, 5, 10000),
+		limiter: auth.NewLimiter(nil, 15*time.Minute, 5, 10000).WithGlobalLimit(300),
 		cfg:     cfg,
 	}
-	s.auth, _ = auth.NewManager(auth.Options{
-		Password: cfg.AdminPassword,
-		TTL:      cfg.SessionTTL,
+	authMgr, err := auth.NewManager(auth.Options{
+		Password:       cfg.AdminPassword,
+		TTL:            cfg.SessionTTL,
+		CredentialFile: cfg.credentialFile(),
 	})
+	if err != nil {
+		return nil, err
+	}
+	s.auth = authMgr
 	s.r = gin.New()
-	s.r.Use(gin.Logger(), gin.Recovery(), securityHeadersMiddleware())
+	// 不记录 query string:别名等隐私信息不应进入访问日志
+	s.r.Use(gin.LoggerWithFormatter(redactedLogFormatter), gin.Recovery(),
+		securityHeadersWithHSTS(cfg.SecureCookie), bodyLimitMiddleware())
 	// 不信任任意代理头,登录限流使用真实连接 IP
 	_ = s.r.SetTrustedProxies(nil)
 	s.register()
-	return s
+	return s, nil
 }
 
-// Run 启动 HTTP 服务。
+// redactedLogFormatter 输出不含 query string 的访问日志。
+//
+// /api/inbox?alias=xxx@icloud.com 这类请求会把隐私别名写进日志,
+// 因此这里只记录路径部分。
+func redactedLogFormatter(p gin.LogFormatterParams) string {
+	return fmt.Sprintf("[GIN] %v | %3d | %13v | %15s | %-7s %s\n",
+		p.TimeStamp.Format("2006/01/02 - 15:04:05"),
+		p.StatusCode,
+		p.Latency,
+		p.ClientIP,
+		p.Method,
+		p.Path, // Path 不含 query string
+	)
+}
+
+// shutdownTimeout 是优雅关闭时等待在途请求完成的最长时间。
+const shutdownTimeout = 10 * time.Second
+
+// Run 启动 HTTP 服务,并在收到 SIGINT/SIGTERM 后优雅关闭。
+//
+// 显式设置各阶段超时,避免慢连接(Slowloris)长期占用连接池。
+// 优雅关闭保证在途请求处理完再退出,不会把写了一半的响应或配置留在磁盘上。
 func (s *Server) Run(addr string) error {
-	return s.r.Run(addr)
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           s.r,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       60 * time.Second,
+		WriteTimeout:      120 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    64 << 10, // 64 KiB
+	}
+
+	// 监听失败的错误通过 channel 回传,避免在 goroutine 里直接退出进程
+	errCh := make(chan error, 1)
+	go func() {
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			errCh <- err
+		}
+	}()
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
+
+	select {
+	case err := <-errCh:
+		return err
+	case sig := <-sigCh:
+		log.Printf("收到信号 %s,开始优雅关闭", sig)
+		ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+		defer cancel()
+		if err := srv.Shutdown(ctx); err != nil {
+			// 超时后强关连接,保证进程能退出
+			_ = srv.Close()
+			return fmt.Errorf("优雅关闭超时: %w", err)
+		}
+		log.Printf("HTTP 服务已关闭")
+		return nil
+	}
 }
 
 // Handler 返回底层 gin 引擎(便于测试)。
@@ -96,6 +180,8 @@ func (s *Server) register() {
 		authed.Use(requireSession(s.auth))
 		{
 			authed.POST("/auth/logout", csrfCheck(s.auth), s.handleLogout)
+			// 修改管理员密码(需会话 + CSRF + 旧密码校验)
+			authed.POST("/auth/password", csrfCheck(s.auth), s.handleChangePassword)
 
 			// ===== 账号管理 =====
 			authed.GET("/accounts", s.listAccountsHandler)
@@ -115,6 +201,10 @@ func (s *Server) register() {
 			authed.GET("/inbox", s.listInboxHandler)
 			authed.GET("/inbox/:message_id", s.getMessageHandler)
 			authed.DELETE("/inbox/:message_id", csrfCheck(s.auth), s.deleteMessageHandler)
+
+			// ===== 转发服务 =====
+			authed.GET("/forward", s.listForwardHandler)
+			authed.POST("/forward/ack", csrfCheck(s.auth), s.ackForwardHandler)
 
 			// ===== 别名管理 =====
 			authed.GET("/aliases", s.listAliasesHandler)
@@ -229,12 +319,12 @@ func (s *Server) listInboxHandler(c *gin.Context) {
 
 func (s *Server) getMessageHandler(c *gin.Context) {
 	accountID := c.Query("account_id")
-	uid, err := strconv.ParseUint(c.Param("message_id"), 10, 32)
-	if accountID == "" || err != nil {
+	messageID := strings.TrimSpace(c.Param("message_id"))
+	if accountID == "" || messageID == "" || len(messageID) > 512 {
 		failCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "account_id 或邮件 ID 无效")
 		return
 	}
-	message, err := s.be.GetMessage(accountID, uint32(uid))
+	message, err := s.be.GetMessage(accountID, messageID)
 	if err != nil {
 		backendFail(c, err)
 		return
@@ -244,16 +334,16 @@ func (s *Server) getMessageHandler(c *gin.Context) {
 
 func (s *Server) deleteMessageHandler(c *gin.Context) {
 	accountID := c.Query("account_id")
-	uid, err := strconv.ParseUint(c.Param("message_id"), 10, 32)
-	if accountID == "" || err != nil {
+	messageID := strings.TrimSpace(c.Param("message_id"))
+	if accountID == "" || messageID == "" || len(messageID) > 512 {
 		failCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "account_id 或邮件 ID 无效")
 		return
 	}
-	if err := s.be.DeleteMessage(accountID, uint32(uid)); err != nil {
+	if err := s.be.DeleteMessage(accountID, messageID); err != nil {
 		backendFail(c, err)
 		return
 	}
-	ok(c, gin.H{"id": c.Param("message_id")})
+	ok(c, gin.H{"id": messageID})
 }
 
 // parseInboxInt 解析整数参数,非法或越界返回错误(不再静默变成 0)。
@@ -266,6 +356,100 @@ func parseInboxInt(raw string, min, max int) (int, error) {
 		return 0, errors.New("out of range")
 	}
 	return v, nil
+}
+
+// ====================================================================
+// 转发服务
+//   GET  /api/forward?account_id=acc[&alias=x@icloud.com][&limit=20][&days=7][&include_body=1]
+//        按别名返回"尚未转发"的新邮件
+//   POST /api/forward/ack
+//        {"account_id":"acc","alias":"x@icloud.com","ids":["1","2"],"forwarded":true}
+//        把自己的转发结果登记为已转发,下次轮询不会再返回
+// ====================================================================
+
+func (s *Server) listForwardHandler(c *gin.Context) {
+	accountID := strings.TrimSpace(c.Query("account_id"))
+	if accountID == "" {
+		failCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "参数缺失: account_id")
+		return
+	}
+	alias := strings.TrimSpace(c.Query("alias"))
+	if alias == "" {
+		failCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "参数缺失: alias")
+		return
+	}
+	if len([]rune(alias)) > 320 {
+		failCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "参数错误: alias 过长")
+		return
+	}
+	limit, err := parseInboxInt(c.DefaultQuery("limit", "20"), 1, 100)
+	if err != nil {
+		failCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "参数错误: limit 需为 1-100 的整数")
+		return
+	}
+	days, err := parseInboxInt(c.DefaultQuery("days", "7"), 1, 90)
+	if err != nil {
+		failCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "参数错误: days 需为 1-90 的整数")
+		return
+	}
+	includeBody := c.Query("include_body") == "1" || c.Query("include_body") == "true"
+
+	result, err := s.be.FetchForForward(ForwardQuery{
+		AccountID:   accountID,
+		Alias:       alias,
+		Limit:       limit,
+		Days:        days,
+		IncludeBody: includeBody,
+	})
+	if err != nil {
+		backendFail(c, err)
+		return
+	}
+	ok(c, result)
+}
+
+type ackForwardReq struct {
+	AccountID string   `json:"account_id"`
+	Alias     string   `json:"alias"`
+	IDs       []string `json:"ids"`
+	Forwarded *bool    `json:"forwarded"`
+}
+
+func (s *Server) ackForwardHandler(c *gin.Context) {
+	var req ackForwardReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		failCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "参数错误: 请求体需为 JSON")
+		return
+	}
+	if strings.TrimSpace(req.AccountID) == "" || strings.TrimSpace(req.Alias) == "" {
+		failCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "参数错误: account_id 与 alias 必填")
+		return
+	}
+	if len(req.IDs) == 0 {
+		failCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "参数错误: ids 不能为空")
+		return
+	}
+	if len(req.IDs) > 200 {
+		failCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "参数错误: 单次最多 200 个 ID")
+		return
+	}
+	for _, id := range req.IDs {
+		if len(id) > 512 {
+			failCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "参数错误: 邮件 ID 过长")
+			return
+		}
+	}
+
+	forwarded := true
+	if req.Forwarded != nil {
+		forwarded = *req.Forwarded
+	}
+	n, err := s.be.MarkForwarded(req.AccountID, req.Alias, req.IDs, forwarded)
+	if err != nil {
+		backendFail(c, err)
+		return
+	}
+	ok(c, gin.H{"account_id": req.AccountID, "alias": req.Alias, "updated": n, "forwarded": forwarded})
 }
 
 // ====================================================================

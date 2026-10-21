@@ -31,7 +31,6 @@ const (
 	authOptions     = "https://idmsa.apple.com/appleauth/auth"
 	submitSecurity  = "https://idmsa.apple.com/appleauth/auth/verify/%s/securitycode"
 	authTrust       = "https://idmsa.apple.com/appleauth/auth/2sv/trust"
-	authWebFmt      = "https://setup.icloud.com/setup/ws/1/accountLogin"
 	authValidateFmt = "https://setup.icloud.com/setup/ws/1/validate?clientBuildNumber=%s&clientMasteringNumber=%s&clientId=%s"
 )
 
@@ -117,7 +116,7 @@ func (c *Client) Login(username, password string, otpProvider OTPProvider) error
 
 	// 11. 保存 Cookie 到 Client
 	cookies := c.extractSessionCookies()
-	c.Cookies = cookies
+	c.replaceCookies(cookies)
 	c.log("登录成功,获取到 %d 个 Cookie", len(cookies))
 	return nil
 }
@@ -330,12 +329,41 @@ func (c *Client) getTrust(state *authState) error {
 	return nil
 }
 
+// authWebReq 是 accountLogin 的请求体。
+//
+// 用结构体 + json.Marshal 而不是字符串拼接:authToken/trustToken 来自
+// 上游响应,若含引号会拼出非法 JSON。
+type authWebReq struct {
+	DsWebAuthToken     string `json:"dsWebAuthToken"`
+	AccountCountryCode string `json:"accountCountryCode"`
+	ExtendedLogin      bool   `json:"extended_login"`
+	TrustToken         string `json:"trustToken"`
+}
+
+// countryCode 返回账号所在区域的 ISO 3166-1 alpha-3 代码。
+//
+// 中国区账号必须报 CHN:报 USA 会拿到错误区域的 Web 服务端点。
+func (c *Client) countryCode() string {
+	if c.Host == "icloud.com.cn" {
+		return "CHN"
+	}
+	return "USA"
+}
+
 // authenticateWeb 认证 iCloud Web 服务
 func (c *Client) authenticateWeb(state *authState) error {
-	body := fmt.Sprintf(`{"dsWebAuthToken":"%s","accountCountryCode":"USA","extended_login":true,"trustToken":"%s"}`,
-		state.authToken, state.trustToken)
+	body, err := json.Marshal(authWebReq{
+		DsWebAuthToken:     state.authToken,
+		AccountCountryCode: c.countryCode(),
+		ExtendedLogin:      true,
+		TrustToken:         state.trustToken,
+	})
+	if err != nil {
+		return err
+	}
 
-	req, err := http.NewRequest("POST", authWebFmt, bytes.NewReader([]byte(body)))
+	// 端点跟随账号区域:setup.icloud.com / setup.icloud.com.cn
+	req, err := http.NewRequest("POST", c.SetupURL()+"/accountLogin", bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
@@ -402,7 +430,7 @@ func (c *Client) updateAuthHeaders(header http.Header, state *authState) http.He
 
 // Validate 验证当前 Cookie 是否有效
 func (c *Client) Validate() (bool, error) {
-	if len(c.Cookies) == 0 {
+	if len(c.CookieSnapshot()) == 0 {
 		return false, fmt.Errorf("无 Cookie")
 	}
 	// 简单实现：尝试调用 validate 端点

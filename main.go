@@ -11,7 +11,6 @@
 //	./icloud-hme -addr :9000        # 指定端口
 //	./icloud-hme -data ./data       # 指定数据目录
 //	./icloud-hme -debug             # 调试模式
-//	./icloud-hme -log-level debug   # 日志级别 (debug/info/warn/error)
 //
 // 安全配置(必填):
 //
@@ -22,6 +21,7 @@ package main
 
 import (
 	"flag"
+	"fmt"
 	"log"
 	"os"
 	"path/filepath"
@@ -37,9 +37,12 @@ func main() {
 	debug := flag.Bool("debug", false, "调试模式 (启用 Gin 调试日志)")
 	flag.Parse()
 
+	// 密码可用于首次初始化;一旦通过界面改过密码,将以数据目录中的
+	// admin_credential.json 为准(该文件只存 argon2 哈希)。
 	adminPassword := os.Getenv("ICLOUD_HME_ADMIN_PASSWORD")
-	if len(adminPassword) < 8 {
-		log.Fatal("请通过环境变量 ICLOUD_HME_ADMIN_PASSWORD 设置管理员密码(至少 8 个字符)")
+	credFile := filepath.Join(*dataDir, "admin_credential.json")
+	if len(adminPassword) < 8 && !fileExists(credFile) {
+		log.Fatal("首次启动请通过环境变量 ICLOUD_HME_ADMIN_PASSWORD 设置管理员密码(至少 8 个字符)")
 	}
 	sessionTTL, err := parseSessionTTL(os.Getenv("ICLOUD_HME_SESSION_TTL"))
 	if err != nil {
@@ -67,6 +70,7 @@ func main() {
 		AdminPassword: adminPassword,
 		SessionTTL:    sessionTTL,
 		SecureCookie:  secureCookie,
+		DataDir:       abs,
 	})
 	if err != nil {
 		log.Fatalf("初始化服务失败: %v", err)
@@ -76,9 +80,21 @@ func main() {
 	_ = os.Unsetenv("ICLOUD_HME_ADMIN_PASSWORD")
 
 	log.Printf("HTTP 服务就绪 addr=%s", *addr)
-	if err := srv.Run(*addr); err != nil {
-		log.Fatalf("服务启动失败: %v", err)
+	runErr := srv.Run(*addr)
+
+	// 先关账号层(等待在途会话校验收尾),再退出进程;
+	// 上面的 defer 仍作为启动期异常退出的兜底,Close 本身幂等。
+	mgr.Close()
+	if runErr != nil {
+		log.Fatalf("服务退出: %v", runErr)
 	}
+	log.Printf("服务已正常停止")
+}
+
+// fileExists 判断文件是否存在(用于判断是否已初始化过密码)。
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
 }
 
 // parseSessionTTL 解析会话有效期,默认 12h,范围 15m-168h。
@@ -91,7 +107,7 @@ func parseSessionTTL(raw string) (time.Duration, error) {
 		return 0, err
 	}
 	if d < 15*time.Minute || d > 168*time.Hour {
-		return 0, err
+		return 0, fmt.Errorf("ICLOUD_HME_SESSION_TTL 需在 15m–168h 之间,当前为 %s", raw)
 	}
 	return d, nil
 }

@@ -4,6 +4,7 @@ import (
 	stdhtml "html"
 	"regexp"
 	"strings"
+	"unicode/utf8"
 )
 
 var (
@@ -18,9 +19,21 @@ var (
 	cssDeclarationRE = regexp.MustCompile(`(?i)(^|[;{])\s*[-a-z_][\w-]*\s*:\s*[^;{}]+`)
 )
 
+// maxPreviewInputBytes 限制参与预览清洗的输入长度。
+// 预览只需要开头一段文本,超长正文(如 5MB 的 HTML 邮件)没必要整体扫描。
+const maxPreviewInputBytes = 256 * 1024
+
 // sanitizePreview converts an email preview to readable text and removes
 // presentation-only HTML/CSS that mail clients commonly include.
 func sanitizePreview(raw string) string {
+	if len(raw) > maxPreviewInputBytes {
+		// 在 UTF-8 边界上截断,避免切出半个多字节字符
+		cut := maxPreviewInputBytes
+		for cut > 0 && !utf8.RuneStart(raw[cut]) {
+			cut--
+		}
+		raw = raw[:cut]
+	}
 	text := stripHTML(raw)
 	return sanitizePlainPreview(text)
 }
@@ -94,26 +107,42 @@ func looksLikeCSS(text string) bool {
 		(braces >= 3 && declarations >= 3 && semicolons >= 3)
 }
 
+// stripCSSRules 移除平衡的 CSS 规则块,保留规则之外的文本。
+//
+// 实现为一趟扫描:先用单个游标记录"保留区间",最后一次性拼接。
+// 旧实现每移除一条规则就对整串重新切片拼接(并从头部重扫),
+// 在大量 `{...}` 的正文上会退化为 O(n²)。
 func stripCSSRules(text string) string {
-	for {
-		open := strings.IndexByte(text, '{')
+	var b strings.Builder
+	b.Grow(len(text))
+
+	kept := 0 // 已保留内容的结束位置
+	i := 0
+	for i < len(text) {
+		open := strings.IndexByte(text[i:], '{')
 		if open < 0 {
-			return text
+			break
 		}
+		open += i
 		close := matchingBrace(text, open)
 		if close < 0 {
-			return text
+			// 花括号不平衡:剩余内容原样保留
+			break
 		}
-
+		// 规则起点回溯到行首
 		start := open
-		for start > 0 {
+		for start > kept {
 			if text[start-1] == '}' || text[start-1] == '\n' || text[start-1] == '\r' {
 				break
 			}
 			start--
 		}
-		text = text[:start] + text[close+1:]
+		b.WriteString(text[kept:start])
+		i = close + 1
+		kept = i
 	}
+	b.WriteString(text[kept:])
+	return b.String()
 }
 
 func matchingBrace(text string, open int) int {

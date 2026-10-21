@@ -80,6 +80,36 @@ X-CSRF-Token: <token>
 {"success": true, "data": {"logged_out": true}}
 ```
 
+### 3.1. 修改密码
+
+```http
+POST /api/auth/password
+Cookie: hme_session=...
+X-CSRF-Token: <token>
+Content-Type: application/json
+
+{
+  "old_password": "当前密码",
+  "new_password": "新密码"
+}
+```
+
+**响应：**
+
+```json
+{"success": true, "data": {"changed": true}}
+```
+
+规则与安全行为：
+
+- 必须同时通过会话校验与 CSRF 校验
+- **必须提供当前密码**，防止会话被劫持后直接改密码锁死管理员
+- 新密码至少 8 位；需「字母+数字」或长度 ≥16
+- 新密码不能与当前密码相同
+- 旧密码错误返回 `401 INVALID_CREDENTIALS`，且计入独立限流
+- 修改成功后**注销其它所有会话**，当前会话保持登录
+- 新密码经 argon2id 派生后写入 `data/admin_credential.json`（仅存哈希），重启后仍然有效
+
 ---
 
 ## 账号端点
@@ -90,7 +120,7 @@ X-CSRF-Token: <token>
 GET /api/accounts
 ```
 
-**响应：** `Summary[]`，排序为 active → pending → error，同状态按 name、id。
+**响应：** `Summary[]`，排序为 active → validating → pending → error，同状态按 name、id。
 
 ```json
 {
@@ -116,7 +146,7 @@ GET /api/accounts
 }
 ```
 
-**禁止出现的字段：** `cookies`、`app_password`、`proxy`。`status_message` 只映射固定文案（pending → "等待配置或验证凭据"，error → "凭据验证失败"），不返回内部错误原文。
+**禁止出现的字段：** `cookies`、`app_password`、`proxy`。`status_message` 只映射固定文案（validating → "正在校验凭据…"，pending → "等待配置或验证凭据"，error → "凭据验证失败"），不返回内部错误原文。
 
 ### 5. 添加账号
 
@@ -139,8 +169,12 @@ X-CSRF-Token: <token>
 - `proxy` 可选，必须是 `http`/`https`/`socks5` URL
 - `cookies` 可选，支持 Cookie Header 字符串或 JSON 文本
 - 无 Cookie 时状态为 `pending`，不访问网络
+- 有 Cookie 时状态为 `validating`：凭据的**输入校验同步完成**（格式错误立即返回 `400`），
+  但访问 iCloud 的会话校验在后台进行，接口不再等待上游（此前最坏会阻塞 >90s）
+- 校验结束后状态自动变为 `active` 或 `error`，客户端可轮询 `GET /api/accounts` 获取结果
+- 进程重启时残留的 `validating` 会被回收为 `pending`
 
-**成功响应：** `201`，返回 `Summary`。
+**成功响应：** `201`，返回 `Summary`，其中 `status` 为 `validating` 或 `pending`。
 
 ### 6. 编辑账号基本信息
 
@@ -181,6 +215,10 @@ X-CSRF-Token: <token>
 
 两种输入最终都交给 `account.ParseCookieInput`。响应只返回更新后的 `Summary`。
 
+- 与添加账号一致：Cookie 先落盘，状态置为 `validating`，会话校验在后台进行
+- 校验完成后状态变为 `active` 或 `error`，客户端轮询 `GET /api/accounts` 即可
+- 若校验进行中又换了 Cookie，当前轮结果按旧凭据丢弃，服务端会自动补跑一轮
+
 ### 9. 设置 App 专用密码
 
 ```http
@@ -214,6 +252,7 @@ X-CSRF-Token: <token>
 ```
 
 **响应：** `{"id": "acc_3"}`。不存在返回 `404 ACCOUNT_NOT_FOUND`。
+落盘失败返回 `500 STORAGE_FAILURE`，此时账号**未被删除**（服务端会回滚内存状态），可重试。
 
 ---
 
@@ -281,6 +320,141 @@ GET /api/inbox?account_id=acc_1&alias=xyz123@icloud.com&limit=20&days=7
 ```
 
 `method` 为 `imap` 或 `web_api`。IMAP 路径支持服务端按收件人搜索；Web API 路径拉取后本地过滤。
+
+> **注意**：IMAP 模式下列表只为生成预览拉取正文前缀（前 4 KB），不再下载整封正文，
+> 因此高频轮询的流量开销大幅降低。需要完整正文请调用下方的「读取邮件详情」。
+
+### 13.1. 读取邮件详情
+
+```http
+GET /api/inbox/1042?account_id=acc_1
+```
+
+- 邮件 ID 为不透明字符串：IMAP 模式下是 UID（纯数字），Web API 模式下是 `threadId`
+- 两种 ID 都支持，不再因为「不是数字」直接返回 400
+
+**响应：**
+
+```json
+{
+  "success": true,
+  "data": {
+    "id": "1042",
+    "from": "noreply@github.com",
+    "to": "xyz123@icloud.com",
+    "subject": "验证你的邮箱",
+    "date": "2026-07-09T14:32:10+08:00",
+    "preview": "…",
+    "body": "完整的正文纯文本",
+    "content_type": "text/html"
+  }
+}
+```
+
+### 13.2. 删除邮件
+
+```http
+DELETE /api/inbox/1042?account_id=acc_1
+```
+
+仅 IMAP 模式下可用。若邮件 ID 来自 Web API（非数字 `threadId`），返回
+`400 UNSUPPORTED_IN_WEB_MODE`。
+
+### 13.3. 转发服务：拉取待转发邮件
+
+面向「隐藏邮箱分发给多人、再由服务按别名转发」的场景。与「读取邮件」的区别：
+
+- `alias` **必填**（按别名路由给不同的人）
+- 默认只返回**尚未标记为已转发**的邮件，从源头避免重复转发
+- 可选直接带回正文，省掉一次详情请求
+
+```http
+GET /api/forward?account_id=acc_1&alias=xyz123@icloud.com&limit=20&days=7&include_body=1
+```
+
+| 参数 | 说明 |
+|---|---|
+| `account_id` | 必填 |
+| `alias` | 必填，只取投递到该别名的邮件 |
+| `limit` | 1–100（默认 20） |
+| `days` | 1–90（默认 7） |
+| `include_body` | `1`/`true` 时同时返回正文 |
+
+**响应：**
+
+```json
+{
+  "success": true,
+  "data": {
+    "account_id": "acc_1",
+    "alias": "xyz123@icloud.com",
+    "count": 1,
+    "method": "imap",
+    "messages": [
+      {
+        "id": "1042",
+        "from": "noreply@example.com",
+        "to": "xyz123@icloud.com",
+        "subject": "欢迎注册",
+        "date": "2026-07-09T14:32:10+08:00",
+        "preview": "感谢您的注册…",
+        "body": "（仅 include_body=1 时返回）",
+        "forwarded": false
+      }
+    ]
+  }
+}
+```
+
+### 13.4. 转发服务：登记已转发
+
+拿到待转发邮件并成功转发后调用，下次轮询不会再返回这批邮件。
+
+```http
+POST /api/forward/ack
+Content-Type: application/json
+X-CSRF-Token: <csrf_token>
+
+{
+  "account_id": "acc_1",
+  "alias": "xyz123@icloud.com",
+  "ids": ["1042", "1043"],
+  "forwarded": true
+}
+```
+
+- `ids` 必填，单次最多 200 个
+- `forwarded` 省略时默认 `true`；传 `false` 可**取消**标记（转发失败需要重试时用）
+- 标记持久化在数据目录的 `forwarded.json`，按「账号 + 别名 + 邮件 ID」去重，别名大小写不敏感
+
+**响应：**
+
+```json
+{
+  "success": true,
+  "data": {
+    "account_id": "acc_1",
+    "alias": "xyz123@icloud.com",
+    "updated": 2,
+    "forwarded": true
+  }
+}
+```
+
+**转发服务的典型轮询顺序：**
+
+```bash
+# 1. 拉取还没转发的邮件
+curl -b jar -H "X-CSRF-Token: $CSRF" \
+  "http://localhost:8081/api/forward?account_id=acc_1&alias=xyz123@icloud.com&include_body=1"
+
+# 2. 自己把邮件转发给对应的人…
+
+# 3. 转发成功后登记,避免下一轮重复转发
+curl -b jar -H "X-CSRF-Token: $CSRF" -H 'Content-Type: application/json' \
+  -d '{"account_id":"acc_1","alias":"xyz123@icloud.com","ids":["1042"]}' \
+  http://localhost:8081/api/forward/ack
+```
 
 ### 14. 列出别名
 

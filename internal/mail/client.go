@@ -5,23 +5,37 @@
 package mail
 
 import (
+	"bytes"
+	"context"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"mime"
+	"mime/multipart"
 	"mime/quotedprintable"
+	"net"
 	"net/mail"
+	"net/textproto"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/emersion/go-imap"
 	"github.com/emersion/go-imap/client"
 	"github.com/emersion/go-message/charset"
+	"icloud-hme/internal/netsafe"
 )
 
 const (
 	IMAPServer = "imap.mail.me.com"
 	IMAPPort   = 993
+
+	// previewFetchBytes 是列表查询时为生成预览而拉取的正文前缀字节数。
+	// 只取前缀即可覆盖 OTP 验证码等关键信息,避免为 preview 下载整封正文。
+	previewFetchBytes = 4096
+	// previewMaxRunes 是返回给前端的预览最大字符数,防止超长正文撑爆响应。
+	previewMaxRunes = 500
 )
 
 // Message 是一封邮件的摘要信息。
@@ -48,6 +62,8 @@ type Client struct {
 	server   string
 	port     int
 	cli      *client.Client
+	// guard 非 nil 时,拨号前校验目标地址(防 SSRF)。
+	guard *netsafe.Policy
 }
 
 // NewClient 创建 IMAP 客户端。需在调用其它方法前先 Connect。
@@ -60,6 +76,28 @@ func NewClientWithServer(username, password, server string, port int) *Client {
 	return &Client{username: username, password: password, server: server, port: port}
 }
 
+// WithGuard 附加出站地址限制策略。用于用户自定义 IMAP 服务器的场景,
+// 防止把本服务当作内网探测器(SSRF)。
+func (c *Client) WithGuard(p netsafe.Policy) *Client {
+	c.guard = &p
+	return c
+}
+
+// imapDialer 把 netsafe.GuardedDialer 适配为 go-imap 的 Dialer 接口。
+type imapDialer struct {
+	d netsafe.GuardedDialer
+}
+
+// Dial 在建立连接前校验目标地址。
+func (x *imapDialer) Dial(network, addr string) (net.Conn, error) {
+	return x.d.DialContext(context.Background(), network, addr)
+}
+
+// addr 返回规范化的 host:port(IPv6 会正确加方括号)。
+func (c *Client) addr() string {
+	return net.JoinHostPort(c.server, strconv.Itoa(c.port))
+}
+
 // Connect 连接并登录 IMAP 服务器。已连接且存活时直接复用。
 func (c *Client) Connect() error {
 	if c.cli != nil {
@@ -68,8 +106,17 @@ func (c *Client) Connect() error {
 		}
 		c.forceClose()
 	}
-	addr := fmt.Sprintf("%s:%d", c.server, c.port)
-	cli, err := client.DialTLS(addr, nil)
+	addr := c.addr()
+
+	var cli *client.Client
+	var err error
+	if c.guard != nil {
+		// 拨号层校验:在真正建连前拦截内网/保留地址
+		dialer := &imapDialer{d: netsafe.GuardedDialer{Policy: *c.guard}}
+		cli, err = client.DialWithDialerTLS(dialer, addr, nil)
+	} else {
+		cli, err = client.DialTLS(addr, nil)
+	}
 	if err != nil {
 		return fmt.Errorf("IMAP 连接失败: %w", err)
 	}
@@ -147,8 +194,13 @@ func (c *Client) ListInbox(limit int, days int) ([]Message, error) {
 	seqset := new(imap.SeqSet)
 	seqset.AddRange(from, mbox.Messages)
 
-	// 拉取完整正文,以便填充 Preview(OTP 验证码在正文中); PEEK 不标已读
-	section := &imap.BodySectionName{Peek: true}
+	// 只拉信封 + 头部 + 正文前 N 字节用于生成预览,不再为 preview 下载整封正文。
+	// 高频轮询(转发服务)场景下这是数量级的流量差异;需要完整正文时走 GetFull。
+	section := &imap.BodySectionName{
+		BodyPartName: imap.BodyPartName{Specifier: imap.TextSpecifier},
+		Peek:         true,
+		Partial:      []int{0, previewFetchBytes},
+	}
 	items := []imap.FetchItem{
 		imap.FetchUid,
 		imap.FetchEnvelope,
@@ -167,7 +219,7 @@ func (c *Client) ListInbox(limit int, days int) ([]Message, error) {
 		m := toMessageWithBody(msg)
 		// days 过滤
 		if days > 0 {
-			if t, err := time.Parse(time.RFC1123Z, m.Date); err == nil {
+			if t := parseMessageDate(m.Date); !t.IsZero() {
 				if time.Since(t) > time.Duration(days)*24*time.Hour {
 					continue
 				}
@@ -433,7 +485,57 @@ func (c *Client) Delete(uid uint32) error {
 	return c.cli.Expunge(nil)
 }
 
+// GetFullByID 按字符串 ID 取邮件详情。IMAP 的 ID 是 UID 的十进制字符串。
+func (c *Client) GetFullByID(id string) (*FullMessage, error) {
+	uid, err := ParseUID(id)
+	if err != nil {
+		return nil, err
+	}
+	return c.GetFull(uid)
+}
+
+// DeleteByID 按字符串 ID 删除邮件。IMAP 的 ID 是 UID 的十进制字符串。
+func (c *Client) DeleteByID(id string) error {
+	uid, err := ParseUID(id)
+	if err != nil {
+		return err
+	}
+	return c.Delete(uid)
+}
+
+// ParseUID 把字符串 ID 解析为 IMAP UID。非数字 ID 说明该邮件来自 Web API 模式。
+func ParseUID(id string) (uint32, error) {
+	v, err := strconv.ParseUint(strings.TrimSpace(id), 10, 32)
+	if err != nil || v == 0 {
+		return 0, fmt.Errorf("邮件 ID 无效: %q (IMAP 模式下应为 UID 数字)", id)
+	}
+	return uint32(v), nil
+}
+
 // ---- 解析工具 ----
+
+// parseMessageDate 解析邮件日期字符串,兼容枚举的多种时间格式。
+// 解析失败返回零值时间(调用方据此跳过过滤)。
+func parseMessageDate(raw string) time.Time {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return time.Time{}
+	}
+	layouts := []string{
+		time.RFC3339,
+		time.RFC3339Nano,
+		time.RFC1123Z,
+		time.RFC1123,
+		"Mon, 2 Jan 2006 15:04:05 -0700",
+		"02 Jan 2006 15:04:05 -0700",
+	}
+	for _, layout := range layouts {
+		if t, err := time.Parse(layout, raw); err == nil {
+			return t
+		}
+	}
+	return time.Time{}
+}
 
 func toMessage(msg *imap.Message) Message {
 	m := Message{}
@@ -466,26 +568,57 @@ func toMessage(msg *imap.Message) Message {
 }
 
 // toMessageWithBody 在 toMessage 基础上解析正文填充 Preview(供 OTP 提取)。
+//
+// 只取正文前缀(FETCH BODY[TEXT]<0.N>),因此不能假设拿到的是完整 MIME 体:
+// 解析失败时退化为直接清洗原始片段,保证预览仍然有内容。
 func toMessageWithBody(msg *imap.Message) Message {
 	m := toMessage(msg)
 	// Fetch 可能用 BODY[] 或 BODY.PEEK[], 两种 section 都试
-	for _, section := range []*imap.BodySectionName{{Peek: true}, {}} {
+	for _, section := range []*imap.BodySectionName{
+		{BodyPartName: imap.BodyPartName{Specifier: imap.TextSpecifier}, Peek: true, Partial: []int{0, previewFetchBytes}},
+		{Peek: true},
+		{},
+	} {
 		r := msg.GetBody(section)
 		if r == nil {
 			continue
 		}
-		em, err := mail.ReadMessage(r)
-		if err != nil {
+		raw, err := io.ReadAll(r)
+		if err != nil || len(raw) == 0 {
 			continue
 		}
-		body, err := readBody(em)
-		if err != nil {
-			continue
+		preview := previewFromRawBody(raw)
+		if preview != "" {
+			m.Preview = preview
+			break
 		}
-		m.Preview = strings.TrimSpace(body)
-		break
 	}
 	return m
+}
+
+// previewFromRawBody 从(可能被截断的)正文片段生成纯文本预览。
+func previewFromRawBody(raw []byte) string {
+	// 优先按 MIME 解析,拿到解码后的正文
+	if em, err := mail.ReadMessage(bytes.NewReader(raw)); err == nil {
+		if body, err := readBody(em); err == nil && strings.TrimSpace(body) != "" {
+			return truncatePreview(body)
+		}
+	}
+	// 片段不是完整 MIME(被截断/直接是正文),退化为原始文本清洗
+	return truncatePreview(sanitizePreview(string(raw)))
+}
+
+// truncatePreview 限制预览长度(按字符,避免截断多字节字符)。
+func truncatePreview(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return ""
+	}
+	runes := []rune(s)
+	if len(runes) <= previewMaxRunes {
+		return s
+	}
+	return strings.TrimSpace(string(runes[:previewMaxRunes])) + "…"
 }
 
 // decodeHeader 解码 RFC 2047 编码的邮件头(如 =?UTF-8?B?xxx?=)。
@@ -502,25 +635,139 @@ func decodeHeader(s string) string {
 }
 
 // readBody 读取邮件正文,优先 text/plain,其次从 HTML 提取纯文本。
+//
+// 邮件正文普遍是 multipart/alternative 且常带 base64 / quoted-printable
+// 传输编码;旧实现只读顶层实体,会把 MIME 源码(boundary、编码块)当成正文,
+// 导致预览与验证码提取失效。此处递归解析 MIME 树并解码传输编码。
 func readBody(msg *mail.Message) (string, error) {
-	ct := msg.Header.Get("Content-Type")
-	if strings.HasPrefix(ct, "text/html") {
-		raw, _ := io.ReadAll(msg.Body)
-		// quoted-printable 解码
-		if strings.Contains(msg.Header.Get("Content-Transfer-Encoding"), "quoted-printable") {
-			r := quotedprintable.NewReader(strings.NewReader(string(raw)))
-			raw, _ = io.ReadAll(r)
-		}
-		return sanitizePreview(string(raw)), nil
-	}
-	// 默认当 text/plain
-	raw, err := io.ReadAll(msg.Body)
+	text, isHTML, err := readEntity(textproto.MIMEHeader(msg.Header), msg.Body, 0)
 	if err != nil {
 		return "", err
 	}
-	if strings.Contains(msg.Header.Get("Content-Transfer-Encoding"), "quoted-printable") {
-		r := quotedprintable.NewReader(strings.NewReader(string(raw)))
-		raw, _ = io.ReadAll(r)
+	if isHTML {
+		return sanitizePreview(text), nil
 	}
-	return sanitizePlainPreview(string(raw)), nil
+	return sanitizePlainPreview(text), nil
+}
+
+// maxMIMEDepth 限制 MIME 嵌套层数,防止恶意深度嵌套拖垮解析。
+const maxMIMEDepth = 8
+
+// maxBodyReadBytes 是单封邮件正文的读取上限(超出部分截断)。
+const maxBodyReadBytes = 1 << 20 // 1 MiB
+
+// readEntity 递归解析一个 MIME 实体,返回正文文本与它是否为 HTML。
+//
+// multipart/* 会遍历子部件并优先选择 text/plain;子部件损坏(常见于
+// 只取了正文前 4KB 的预览场景)时返回已解析到的内容而不是整体失败。
+func readEntity(header textproto.MIMEHeader, body io.Reader, depth int) (text string, isHTML bool, err error) {
+	if depth > maxMIMEDepth {
+		return "", false, fmt.Errorf("MIME 嵌套过深")
+	}
+	mediaType, params, _ := mime.ParseMediaType(header.Get("Content-Type"))
+	mediaType = strings.ToLower(mediaType)
+
+	if strings.HasPrefix(mediaType, "multipart/") {
+		boundary := params["boundary"]
+		if boundary == "" {
+			return "", false, fmt.Errorf("multipart 缺少 boundary")
+		}
+		mr := multipart.NewReader(io.LimitReader(body, maxBodyReadBytes), boundary)
+		var plainText, htmlText string
+		for {
+			part, perr := mr.NextPart()
+			if perr != nil {
+				// io.EOF 是正常结束;其它错误说明数据被截断或损坏,
+				// 用手上已有的内容降级返回。
+				break
+			}
+			partText, partIsHTML, partErr := readEntity(part.Header, part, depth+1)
+			_ = part.Close()
+			if partErr != nil || strings.TrimSpace(partText) == "" {
+				continue
+			}
+			if partIsHTML {
+				if htmlText == "" {
+					htmlText = partText
+				}
+			} else if plainText == "" {
+				plainText = partText
+			}
+			if plainText != "" && htmlText != "" {
+				break // 两种都拿到了,无需继续遍历
+			}
+		}
+		if plainText != "" {
+			return plainText, false, nil
+		}
+		if htmlText != "" {
+			return htmlText, true, nil
+		}
+		return "", false, nil
+	}
+
+	// 叶子部件:附件类实体与转发的原始邮件不参与正文
+	switch {
+	case strings.HasPrefix(mediaType, "application/"),
+		strings.HasPrefix(mediaType, "image/"),
+		strings.HasPrefix(mediaType, "audio/"),
+		strings.HasPrefix(mediaType, "video/"),
+		mediaType == "message/rfc822":
+		return "", false, nil
+	}
+
+	raw, readErr := io.ReadAll(io.LimitReader(body, maxBodyReadBytes))
+	// 部件被截断(预览只取正文前缀)时仍可能有有效内容,
+	// 只要读到了字节就不当作失败。
+	if readErr != nil && len(raw) == 0 {
+		return "", false, readErr
+	}
+	raw = decodeTransferEncoding(raw, header.Get("Content-Transfer-Encoding"))
+
+	// 非 UTF-8 字符集(如 gb2312/gbk)按声明的 charset 转码
+	if cs := strings.TrimSpace(params["charset"]); cs != "" &&
+		!strings.EqualFold(cs, "utf-8") && !strings.EqualFold(cs, "us-ascii") {
+		if r, cerr := charset.Reader(cs, bytes.NewReader(raw)); cerr == nil {
+			if converted, rerr := io.ReadAll(io.LimitReader(r, maxBodyReadBytes)); rerr == nil {
+				raw = converted
+			}
+		}
+	}
+
+	// 缺省 Content-Type 按纯文本处理(与旧行为一致)
+	return string(raw), mediaType == "text/html", nil
+}
+
+// decodeTransferEncoding 解码 base64 / quoted-printable 传输编码。
+// 解码失败(如预览取到的是被截断的编码流)时返回原始字节,交由上层降级处理。
+func decodeTransferEncoding(raw []byte, cte string) []byte {
+	switch strings.ToLower(strings.TrimSpace(cte)) {
+	case "base64":
+		cleaned := make([]byte, 0, len(raw))
+		for _, b := range raw {
+			switch b {
+			case '\r', '\n', ' ', '\t':
+				continue
+			}
+			cleaned = append(cleaned, b)
+		}
+		out := make([]byte, base64.StdEncoding.DecodedLen(len(cleaned)))
+		if n, err := base64.StdEncoding.Decode(out, cleaned); err == nil {
+			return out[:n]
+		}
+		// 去掉 padding 再试一次(部分邮件省略 '=')
+		trimmed := bytes.TrimRight(cleaned, "=")
+		out = make([]byte, base64.RawStdEncoding.DecodedLen(len(trimmed)))
+		if n, err := base64.RawStdEncoding.Decode(out, trimmed); err == nil {
+			return out[:n]
+		}
+		return raw
+	case "quoted-printable":
+		decoded, err := io.ReadAll(quotedprintable.NewReader(bytes.NewReader(raw)))
+		if err != nil {
+			return raw
+		}
+		return decoded
+	}
+	return raw
 }

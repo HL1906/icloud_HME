@@ -12,7 +12,7 @@ import (
 // TestSPAAPI404JSON 验证 /api/not-found 返回 JSON 404 而非 HTML。
 func TestSPAAPI404JSON(t *testing.T) {
 	f := &fakeBackend{}
-	s := newWithBackend(f, Config{
+	s := mustServer(t, f, Config{
 		Debug:         false,
 		AdminPassword: "admin-pass-2026-strong",
 	})
@@ -39,7 +39,7 @@ func TestSPAAPI404JSON(t *testing.T) {
 // TestSPAIndexServed 验证根路径由 webui 服务(返回 index 而非 404)。
 func TestSPAIndexServed(t *testing.T) {
 	f := &fakeBackend{}
-	s := newWithBackend(f, Config{
+	s := mustServer(t, f, Config{
 		Debug:         false,
 		AdminPassword: "admin-pass-2026-strong",
 	})

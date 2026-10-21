@@ -5,8 +5,10 @@
 package account
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"sort"
@@ -15,8 +17,10 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"icloud-hme/internal/fsutil"
 	"icloud-hme/internal/hme"
 	"icloud-hme/internal/mail"
+	"icloud-hme/internal/netsafe"
 )
 
 // Account 描述一个 iCloud 账号。
@@ -47,6 +51,16 @@ type MailboxConfig struct {
 	Password string `json:"password,omitempty"`
 }
 
+// maxConcurrentValidations 限制后台会话校验的并发度。
+//
+// 每次校验都要访问上游(最坏 3 次重试 × 30s),不限并发的话批量导入
+// 会把出站连接和上游限流打满。
+const maxConcurrentValidations = 4
+
+// closeWait 是 Close 等待在途校验的最长时间。
+// 校验卡在上游超时时不能让进程退不出去,超时后结果由 closed 丢弃。
+const closeWait = 3 * time.Second
+
 // Manager 管理多个 iCloud 账号,线程安全。
 type Manager struct {
 	mu       sync.RWMutex
@@ -54,6 +68,27 @@ type Manager struct {
 	dataDir  string
 	dataFile string
 	imapPool *mail.Pool // IMAP 长连接池
+	// mailboxGuard 是外部收件邮箱 IMAP 连通的地址限制(防 SSRF)。
+	mailboxGuard netsafe.Policy
+
+	// 后台会话校验:添加账号时不再同步等待上游(最坏 >90s 逼近写超时),
+	// 改为先落盘返回,异步校验后回写 status。
+	validateFn func(*Account)  // 校验实现,便于测试替换
+	inflight   map[string]bool // 正在排队的账号 id,避免重复校验
+	revalidate map[string]bool // 校验途中凭据又被替换,结束后需再跑一轮
+	sem        chan struct{}   // 并发闸门
+	wg         sync.WaitGroup  // 在途校验
+	ctx        context.Context
+	cancel     context.CancelFunc
+	closed     bool
+	closeOnce  sync.Once
+}
+
+// guardPolicy 返回外部邮箱的地址限制策略(值拷贝,线程安全)。
+func (m *Manager) guardPolicy() netsafe.Policy {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.mailboxGuard
 }
 
 // cloneCookies 返回 Cookie map 的独立副本。
@@ -80,26 +115,58 @@ func copyAccount(acc *Account) *Account {
 
 // NewManager 创建管理器。dataDir 用于存放 accounts.json。
 func NewManager(dataDir string) (*Manager, error) {
-	if err := os.MkdirAll(dataDir, 0755); err != nil {
+	// 0700:目录内的 accounts.json 含 Cookie 与 App 专用密码,不应让其他本地用户进入
+	if err := os.MkdirAll(dataDir, 0o700); err != nil {
 		return nil, err
 	}
+	ctx, cancel := context.WithCancel(context.Background())
 	m := &Manager{
-		accounts: make(map[string]*Account),
-		dataDir:  dataDir,
-		dataFile: filepath.Join(dataDir, "accounts.json"),
-		imapPool: mail.NewPool(),
+		accounts:     make(map[string]*Account),
+		dataDir:      dataDir,
+		dataFile:     filepath.Join(dataDir, "accounts.json"),
+		imapPool:     mail.NewPool(),
+		mailboxGuard: netsafe.DefaultIMAPPolicy(),
+		validateFn:   (*Account).validateCookies,
+		inflight:     make(map[string]bool),
+		revalidate:   make(map[string]bool),
+		sem:          make(chan struct{}, maxConcurrentValidations),
+		ctx:          ctx,
+		cancel:       cancel,
 	}
 	if err := m.load(); err != nil {
+		cancel()
 		return nil, err
 	}
+	m.normalizeStaleStatus()
 	return m, nil
 }
 
-// Close 释放 IMAP 连接池等资源。
+// Close 释放 IMAP 连接池等资源,并等待在途的后台校验收尾。
+//
+// 后台校验可能正卡在上游超时里,这里不无限等:超时后直接放行退出,
+// 迟到的校验结果会因 closed 标记被丢弃,不会污染已落盘的数据。
 func (m *Manager) Close() {
-	if m.imapPool != nil {
-		m.imapPool.Close()
-	}
+	m.closeOnce.Do(func() {
+		m.mu.Lock()
+		m.closed = true
+		m.mu.Unlock()
+		m.cancel()
+
+		done := make(chan struct{})
+		go func() {
+			m.wg.Wait()
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(closeWait):
+			log.Printf("[account] 后台校验未在 %s 内结束,直接关闭", closeWait)
+		}
+
+		if m.imapPool != nil {
+			m.imapPool.Close()
+		}
+	})
 }
 
 // Reload 重新加载 accounts.json 配置文件。
@@ -130,6 +197,19 @@ func (m *Manager) load() error {
 	return nil
 }
 
+// normalizeStaleStatus 把启动时残留的 validating 状态回收为 pending。
+//
+// 进程在后台校验途中退出时,accounts.json 里会留下 validating;
+// 该状态没有对应的 goroutine 会再推进它,不回收就会永久显示"校验中"。
+func (m *Manager) normalizeStaleStatus() {
+	for _, acc := range m.accounts {
+		if acc != nil && acc.Status == "validating" {
+			acc.Status = "pending"
+			acc.LastError = ""
+		}
+	}
+}
+
 func (m *Manager) save() error {
 	wrapper := struct {
 		Accounts  map[string]*Account `json:"accounts"`
@@ -142,7 +222,8 @@ func (m *Manager) save() error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(m.dataFile, raw, 0600)
+	// 原子写入:避免写一半导致账号配置(含 Cookie)整体损坏
+	return fsutil.WriteFileAtomic(m.dataFile, raw, 0o600)
 }
 
 // ParseCookieInput 解析 Cookie 输入,支持两种格式:
@@ -194,8 +275,9 @@ func ParseCookieInput(raw string) (map[string]string, error) {
 
 // AddAccount 添加一个账号。cookieInput 可为空,后续可通过 /login 获取。
 //
-// cookieInput 支持 Header String 或 JSON。校验失败仍会保存账号(status=error),
-// 方便用户后续修正 Cookie 后重新校验。
+// cookieInput 支持 Header String 或 JSON。会话校验在后台进行:本方法只做
+// 本地解析与落盘,不访问网络,调用方应通过账户 status(validating → active/error)
+// 获取校验结果。
 //
 // 兼容入口:新调用方请使用 AddAccountWithInput。
 func (m *Manager) AddAccount(name, cookieInput, host, proxy string) (*Account, error) {
@@ -209,16 +291,22 @@ func (m *Manager) AddAccount(name, cookieInput, host, proxy string) (*Account, e
 	m.mu.Lock()
 	m.accounts[acc.ID] = acc
 	saveErr := m.save()
+	snap := copyAccount(acc)
 	m.mu.Unlock()
 	if saveErr != nil {
 		return nil, saveErr
 	}
-	return acc, nil
+	if len(snap.Cookies) > 0 {
+		m.startValidation(acc.ID)
+	}
+	return snap, nil
 }
 
 // AddAccountWithInput 添加账号(带完整校验)。
 //
-// 无 Cookie 的添加路径不访问网络;有 Cookie 时在锁外对快照执行会话校验。
+// 输入校验(名称/邮箱/主机/代理/Cookie 格式)同步完成,失败立即报错;
+// 需要访问 iCloud 的会话校验放到后台,避免请求线程被上游超时(最坏 >90s)
+// 拖到超过 HTTP 写超时。返回的 Summary 中 status 为 validating 或 pending。
 func (m *Manager) AddAccountWithInput(input AddAccountInput) (Summary, error) {
 	name, err := validateName(input.Name)
 	if err != nil {
@@ -242,14 +330,22 @@ func (m *Manager) AddAccountWithInput(input AddAccountInput) (Summary, error) {
 	m.mu.Lock()
 	m.accounts[acc.ID] = acc
 	saveErr := m.save()
+	// Summary 必须在锁内取:解锁后后台校验可能已经改写了 acc.Status
+	sum := acc.Summary()
+	hasCookies := len(acc.Cookies) > 0
 	m.mu.Unlock()
 	if saveErr != nil {
 		return Summary{}, saveErr
 	}
-	return acc.Summary(), nil
+	if hasCookies {
+		m.startValidation(acc.ID)
+	}
+	return sum, nil
 }
 
-// newAccount 构造账号;cookieInput 非空时在锁外对快照执行会话校验。
+// newAccount 构造账号,不访问网络。
+//
+// 有 Cookie 时状态为 validating,由调用方在落盘后调度后台校验。
 func (m *Manager) newAccount(name, icloudEmail, cookieInput, host, proxy string) (*Account, error) {
 	var cookies map[string]string
 	if cookieInput != "" {
@@ -262,7 +358,12 @@ func (m *Manager) newAccount(name, icloudEmail, cookieInput, host, proxy string)
 		cookies = make(map[string]string)
 	}
 
-	acc := &Account{
+	status := "pending"
+	if len(cookies) > 0 {
+		status = "validating"
+	}
+
+	return &Account{
 		ID:          "acc_" + uuid.New().String()[:8],
 		Name:        name,
 		RealEmail:   icloudEmail,
@@ -270,15 +371,120 @@ func (m *Manager) newAccount(name, icloudEmail, cookieInput, host, proxy string)
 		Cookies:     cookies,
 		Host:        host,
 		Proxy:       proxy,
-		Status:      "pending", // 无 Cookie 时为 pending
+		Status:      status,
 		CreatedAt:   time.Now().Format(time.RFC3339),
+	}, nil
+}
+
+// startValidation 异步校验指定账号的会话。
+//
+// 同一账号同时只会有一个校验任务。若校验在途时凭据又被替换(用户改了 Cookie),
+// 这里只记一个"再来一轮"标记,由当前任务结束后自己再跑一次——否则新凭据
+// 会一直停在 validating(旧结果因 Cookie 不匹配被丢弃,又没人补跑)。
+func (m *Manager) startValidation(id string) {
+	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return
+	}
+	if m.inflight[id] {
+		m.revalidate[id] = true
+		m.mu.Unlock()
+		return
+	}
+	m.inflight[id] = true
+	m.wg.Add(1)
+	m.mu.Unlock()
+
+	go func() {
+		defer m.wg.Done()
+		for {
+			select {
+			case m.sem <- struct{}{}:
+			case <-m.ctx.Done():
+				m.finishValidation(id)
+				return
+			}
+			m.validateInBackground(id)
+			<-m.sem
+
+			m.mu.Lock()
+			again := m.revalidate[id]
+			delete(m.revalidate, id)
+			_, exists := m.accounts[id]
+			m.mu.Unlock()
+			if !again || !exists || m.isClosed() {
+				break
+			}
+		}
+		m.finishValidation(id)
+	}()
+}
+
+// finishValidation 清理账号的在途标记。
+func (m *Manager) finishValidation(id string) {
+	m.mu.Lock()
+	delete(m.inflight, id)
+	delete(m.revalidate, id)
+	m.mu.Unlock()
+}
+
+// isClosed 返回管理器是否已关闭。
+func (m *Manager) isClosed() bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.closed
+}
+
+// validateInBackground 在锁外校验会话,再持锁回写状态。
+func (m *Manager) validateInBackground(id string) {
+	// 校验实现里的 panic 不能带崩整个进程
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[account] 后台校验 panic id=%s: %v", id, r)
+		}
+	}()
+
+	m.mu.RLock()
+	acc, ok := m.accounts[id]
+	var snap *Account
+	if ok {
+		snap = copyAccount(acc)
+	}
+	m.mu.RUnlock()
+	if !ok || len(snap.Cookies) == 0 {
+		return
 	}
 
-	// 有 Cookie 才校验会话
-	if len(cookies) > 0 {
-		acc.validateCookies()
+	origCookies := cloneCookies(snap.Cookies)
+	m.validateFn(snap)
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed {
+		return
 	}
-	return acc, nil
+	cur, ok := m.accounts[id]
+	if !ok {
+		return
+	}
+	// 校验期间 Cookie 被改过:本次结果基于旧凭据,丢弃以免覆盖新值
+	if !sameCookies(cur.Cookies, origCookies) {
+		return
+	}
+	cur.Cookies = snap.Cookies
+	cur.Status = snap.Status
+	cur.LastError = snap.LastError
+	cur.LastValidated = snap.LastValidated
+	cur.RealEmail = snap.RealEmail
+	cur.AliasTotal = snap.AliasTotal
+	cur.AliasActive = snap.AliasActive
+	if cur.ICloudEmail == "" {
+		cur.ICloudEmail = snap.ICloudEmail
+	}
+	if err := m.save(); err != nil {
+		log.Printf("[account] 后台校验结果落盘失败 id=%s: %v", id, err)
+	}
 }
 
 // validateCookies 用 Cookie 校验会话并填充账号身份(在锁外对快照操作)。
@@ -295,13 +501,13 @@ func (a *Account) validateCookies() {
 	}
 	if err := client.ValidateSession(); err != nil {
 		// validate 即使失败也可能通过 Set-Cookie 刷新部分会话状态。
-		a.Cookies = client.Cookies
+		a.Cookies = client.CookieSnapshot()
 		a.Status = "error"
 		a.LastError = truncate(err.Error(), 300)
 		return
 	}
 	// 显式接收 validate 刷新的 Cookie，不依赖传入 map 的引用关系。
-	a.Cookies = client.Cookies
+	a.Cookies = client.CookieSnapshot()
 	a.Status = "active"
 	if info := client.AccountInfo(); info != nil {
 		a.RealEmail = firstNonEmpty(info.AppleID, info.PrimaryEmail)
@@ -389,15 +595,23 @@ func (m *Manager) UpdateProxy(id, proxy string) (Summary, error) {
 }
 
 // RemoveAccount 删除账号。
-func (m *Manager) RemoveAccount(id string) bool {
+//
+// 落盘失败时回滚内存删除:否则"内存已删、盘上还在"会让账号在下次启动时复活。
+func (m *Manager) RemoveAccount(id string) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if _, ok := m.accounts[id]; !ok {
-		return false
+	acc, ok := m.accounts[id]
+	if !ok {
+		return false, nil
 	}
 	delete(m.accounts, id)
-	_ = m.save()
-	return true
+	if err := m.save(); err != nil {
+		m.accounts[id] = acc
+		return true, err
+	}
+	// 在途校验会在回写时发现账号已不存在而自动退出
+	delete(m.revalidate, id)
+	return true, nil
 }
 
 // GetAccount 返回账号深拷贝(含 Cookies),调用方可安全使用。
@@ -458,10 +672,12 @@ func statusRank(status string) int {
 	switch status {
 	case "active":
 		return 0
-	case "pending":
+	case "validating":
 		return 1
-	default:
+	case "pending":
 		return 2
+	default:
+		return 3
 	}
 }
 
@@ -517,12 +733,12 @@ func (m *Manager) HMEClientWithPassword(id, password string, otpProvider hme.OTP
 
 	// 先保存 accountLogin 返回的 Cookie，随后通过 validate 刷新会话并再次持久化。
 	// 国区与美区都走同一条刷新链路，避免只保存登录阶段的临时 token。
-	if err := m.SaveCookies(id, client.Cookies); err != nil {
+	if err := m.SaveCookies(id, client.CookieSnapshot()); err != nil {
 		return nil, err
 	}
 	if err := client.ValidateSession(); err != nil {
 		// validate 的失败响应也可能携带 Set-Cookie，尽量保留服务端最新状态。
-		_ = m.SaveCookies(id, client.Cookies)
+		_ = m.SaveCookies(id, client.CookieSnapshot())
 		return nil, err
 	}
 
@@ -533,7 +749,7 @@ func (m *Manager) HMEClientWithPassword(id, password string, otpProvider hme.OTP
 		m.mu.Unlock()
 		return nil, fmt.Errorf("账号不存在: %s", id)
 	}
-	cur.Cookies = cloneCookies(client.Cookies)
+	cur.Cookies = client.CookieSnapshot()
 	cur.Status = "active"
 	cur.LastValidated = time.Now().Format(time.RFC3339)
 	cur.LastError = ""
@@ -567,7 +783,8 @@ func (m *Manager) MailClient(id string) (*mail.Client, error) {
 		return nil, fmt.Errorf("账号不存在: %s", id)
 	}
 	if snap.Mailbox != nil && snap.Mailbox.Email != "" && snap.Mailbox.Password != "" {
-		return mail.NewClientWithServer(snap.Mailbox.Email, snap.Mailbox.Password, snap.Mailbox.IMAPHost, snap.Mailbox.IMAPPort), nil
+		return mail.NewClientWithServer(snap.Mailbox.Email, snap.Mailbox.Password, snap.Mailbox.IMAPHost, snap.Mailbox.IMAPPort).
+			WithGuard(m.guardPolicy()), nil
 	}
 	imapEmail := snap.ICloudEmail
 	if imapEmail == "" {
@@ -594,7 +811,8 @@ func (m *Manager) WithMailClient(id string, fn func(*mail.Client) error) error {
 	}
 	m.mu.RUnlock()
 	if mailbox != nil && mailbox.Email != "" && mailbox.Password != "" {
-		mc := mail.NewClientWithServer(mailbox.Email, mailbox.Password, mailbox.IMAPHost, mailbox.IMAPPort)
+		mc := mail.NewClientWithServer(mailbox.Email, mailbox.Password, mailbox.IMAPHost, mailbox.IMAPPort).
+			WithGuard(m.guardPolicy())
 		if err := mc.Connect(); err != nil {
 			return err
 		}
@@ -643,8 +861,15 @@ func (m *Manager) SetMailbox(id string, config MailboxConfig) error {
 	if config.Email == "" || config.IMAPHost == "" || config.Password == "" {
 		return fmt.Errorf("收件邮箱、IMAP 服务器和授权码不能为空")
 	}
-	if strings.Contains(config.IMAPHost, "://") || config.IMAPPort < 1 || config.IMAPPort > 65535 {
+	if strings.Contains(config.IMAPHost, "://") || strings.ContainsAny(config.IMAPHost, "/?#@") {
 		return fmt.Errorf("IMAP 服务器或端口无效")
+	}
+	if config.IMAPPort < 1 || config.IMAPPort > 65535 {
+		return fmt.Errorf("IMAP 服务器或端口无效")
+	}
+	// SSRF 防护:外部主机必须是公网可达的常见 IMAP 端点,禁止指向内网/回环/保留地址
+	if err := m.mailboxGuard.CheckAddr(config.IMAPHost, config.IMAPPort); err != nil {
+		return fmt.Errorf("IMAP 服务器地址不被允许: %w", err)
 	}
 	m.mu.RLock()
 	_, ok := m.accounts[id]
@@ -652,7 +877,8 @@ func (m *Manager) SetMailbox(id string, config MailboxConfig) error {
 	if !ok {
 		return fmt.Errorf("账号不存在: %s", id)
 	}
-	mc := mail.NewClientWithServer(config.Email, config.Password, config.IMAPHost, config.IMAPPort)
+	mc := mail.NewClientWithServer(config.Email, config.Password, config.IMAPHost, config.IMAPPort).
+		WithGuard(m.guardPolicy())
 	if err := mc.Connect(); err != nil {
 		return err
 	}
@@ -696,7 +922,7 @@ func (m *Manager) WebMailClient(id string) (*mail.WebClient, error) {
 			dsid = parts[1]
 		}
 	}
-	return mail.NewWebClient(snap.Cookies, dsid, snap.Host), nil
+	return mail.NewWebClient(snap.Cookies, dsid, snap.Host)
 }
 
 // SetAppPassword 设置 iCloud 邮箱和 App 专用密码,并测试 IMAP 连接。
@@ -754,70 +980,65 @@ func (m *Manager) SaveCookies(id string, cookies map[string]string) error {
 	return m.save()
 }
 
-// UpdateCookies 更新指定账号的 Cookie,并自动校验会话有效性。
+// SaveCookiesIfChanged 仅在 Cookie 实际变化时落盘。
+//
+// accounts.json 含全部账号的 Cookie,每次全量重写代价不小;
+// 转发服务按别名轮询时,每次 ListAliases 都重写一次会造成明显的 IO 放大。
+// 上游没有刷新 token(绝大多数请求)时直接跳过写盘。
+func (m *Manager) SaveCookiesIfChanged(id string, cookies map[string]string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	acc, ok := m.accounts[id]
+	if !ok {
+		return fmt.Errorf("账号不存在: %s", id)
+	}
+	if sameCookies(acc.Cookies, cookies) {
+		return nil
+	}
+	acc.Cookies = cloneCookies(cookies)
+	return m.save()
+}
+
+// sameCookies 判断两份 Cookie 是否完全一致(键集合与值都相同)。
+func sameCookies(a, b map[string]string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, v := range a {
+		if bv, ok := b[k]; !ok || bv != v {
+			return false
+		}
+	}
+	return true
+}
+
+// UpdateCookies 更新指定账号的 Cookie,并在后台校验会话有效性。
+//
+// 只做本地写入并立即返回,不等待上游:校验结果通过 status 反映
+// (validating → active/error),避免粘贴 Cookie 保存时被上游超时卡住 90s。
 func (m *Manager) UpdateCookies(id string, cookies map[string]string) error {
 	if len(cookies) == 0 {
 		return fmt.Errorf("cookies 不能为空")
 	}
-	m.mu.RLock()
-	acc, ok := m.accounts[id]
-	var snap *Account
-	if ok {
-		snap = copyAccount(acc)
-	}
-	m.mu.RUnlock()
-	if !ok {
-		return fmt.Errorf("账号不存在: %s", id)
-	}
-
-	// 自动校验 Cookie 是否有效(锁外对快照操作)
-	snap.Cookies = cookies
-	if snap.Host == "" {
-		snap.Host = "icloud.com"
-	}
-	client, err := hme.NewClient(cookies, snap.Host, snap.Proxy, false)
-	if err != nil {
-		snap.Status = "error"
-		snap.LastError = "创建客户端失败: " + err.Error()
-	} else if err := client.ValidateSession(); err != nil {
-		// validate 即使失败也可能通过 Set-Cookie 刷新部分会话状态。
-		snap.Cookies = client.Cookies
-		snap.Status = "error"
-		snap.LastError = "Cookie 校验失败: " + err.Error()
-	} else {
-		// 显式保存 validate 响应刷新的 Cookie，不依赖传入 map 的引用关系。
-		snap.Cookies = client.Cookies
-		snap.Status = "active"
-		snap.LastValidated = time.Now().Format(time.RFC3339)
-		snap.LastError = ""
-		if info := client.AccountInfo(); info != nil {
-			snap.RealEmail = firstNonEmpty(info.AppleID, info.PrimaryEmail)
-			if snap.ICloudEmail == "" {
-				snap.ICloudEmail = deriveICloudEmail(info)
-			}
-		}
-	}
-
 	m.mu.Lock()
 	cur, ok := m.accounts[id]
 	if !ok {
 		m.mu.Unlock()
 		return fmt.Errorf("账号不存在: %s", id)
 	}
-	cur.Cookies = snap.Cookies
-	cur.Status = snap.Status
-	cur.LastValidated = snap.LastValidated
-	cur.LastError = snap.LastError
-	cur.RealEmail = snap.RealEmail
-	if cur.ICloudEmail == "" {
-		cur.ICloudEmail = snap.ICloudEmail
+	cur.Cookies = cloneCookies(cookies)
+	cur.Status = "validating"
+	cur.LastError = ""
+	if cur.Host == "" {
+		cur.Host = "icloud.com"
 	}
 	saveErr := m.save()
 	m.mu.Unlock()
-	if err != nil {
-		return err
+	if saveErr != nil {
+		return saveErr
 	}
-	return saveErr
+	m.startValidation(id)
+	return nil
 }
 
 // ---- 辅助函数 ----

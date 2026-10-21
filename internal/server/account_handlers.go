@@ -202,7 +202,12 @@ func (s *Server) loginAccountHandler(c *gin.Context) {
 // removeAccountHandler 处理 DELETE /api/accounts/:id。
 func (s *Server) removeAccountHandler(c *gin.Context) {
 	id := c.Param("id")
-	if !s.be.RemoveAccount(id) {
+	found, err := s.be.RemoveAccount(id)
+	if err != nil {
+		backendFail(c, err)
+		return
+	}
+	if !found {
 		failCode(c, http.StatusNotFound, "ACCOUNT_NOT_FOUND", "账号不存在")
 		return
 	}
