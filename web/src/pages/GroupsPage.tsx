@@ -76,11 +76,6 @@ export default function GroupsPage() {
         }
       />
 
-      <p className="hint-block">
-        分组是<strong>本系统</strong>用来归类邮箱的，iCloud 侧没有这个概念，也不会把分组同步到 Apple。
-        删除分组只是把其中的邮箱变回「未分组」，不会停用或删除邮箱本身。
-      </p>
-
       <AsyncState
         loading={loading}
         error={error}

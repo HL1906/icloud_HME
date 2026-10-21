@@ -696,7 +696,7 @@ describe('AliasesPage 收信活动', () => {
     expect(within(filtered).getByText('beta@icloud.com')).toBeInTheDocument()
   })
 
-  it('90 天未收信:头部给出数量,筛选只留久未收信的号', async () => {
+  it('90 天未收信:筛选只留久未收信的号', async () => {
     server.use(
       ...mockList({
         'alpha@icloud.com': { email: 'alpha@icloud.com', last_received_at: receivedAgo(120) },
@@ -705,7 +705,6 @@ describe('AliasesPage 收信活动', () => {
     )
     renderPage()
     await screen.findByText('alpha@icloud.com')
-    expect(screen.getByText(/90 天未收信 1 个/)).toBeInTheDocument()
 
     const user = userEvent.setup()
     await user.selectOptions(screen.getByLabelText('收信'), 'stale90')

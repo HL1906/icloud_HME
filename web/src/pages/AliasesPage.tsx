@@ -4,7 +4,6 @@ import { request, ApiError } from '../api/client'
 import type {
   AccountSummary,
   Alias,
-  AliasActivityResult,
   AliasListResult,
   AliasMeta,
   BulkAliasAction,
@@ -160,8 +159,6 @@ export default function AliasesPage() {
   /** 批量归组的下拉值：'' 表示未选择，NO_GROUP 表示移出分组 */
   const [bulkGroup, setBulkGroup] = useState('')
   const [activityFilter, setActivityFilter] = useState<ActivityFilter>('all')
-  // 上一次扫描的摘要（用于显示"收信数据更新于…"）
-  const [activity, setActivity] = useState<AliasActivityResult | null>(null)
   const [scanning, setScanning] = useState(false)
 
   const [searchParams, setSearchParams] = useSearchParams()
@@ -248,23 +245,6 @@ export default function AliasesPage() {
     }
   }, [accountId, retryKey])
 
-  // 加载上一次收信扫描的摘要:用来提示"收信数据是不是旧的"
-  useEffect(() => {
-    if (!accountId) return
-    let cancelled = false
-    request<AliasActivityResult>(`/api/alias-activity?account_id=${encodeURIComponent(accountId)}`)
-      .then((data) => {
-        if (!cancelled) setActivity(data)
-      })
-      .catch(() => {
-        // 扫描摘要只是辅助信息,拿不到不影响列表本身
-        if (!cancelled) setActivity(null)
-      })
-    return () => {
-      cancelled = true
-    }
-  }, [accountId, retryKey])
-
   const groupById = useMemo(() => {
     const map = new Map<string, Group>()
     for (const group of groups) map.set(group.id, group)
@@ -311,10 +291,6 @@ export default function AliasesPage() {
   // 当前页的数据切片(过滤+排序之后)
   const safePage = Math.min(page, Math.max(1, Math.ceil(filtered.length / pageSize)))
   const pageAliases = filtered.slice((safePage - 1) * pageSize, safePage * pageSize)
-
-  const activeCount = aliases.filter((a) => a.active).length
-  const ungroupedCount = aliases.filter((a) => !meta[a.email.toLowerCase()]?.group_id).length
-  const staleCount = aliases.filter((a) => isStale(a, meta[a.email.toLowerCase()], 90)).length
 
   // 选中集合里可能残留上一次操作删掉的 ID，统一用当前列表过滤一遍再使用，
   // 这样切换账号/刷新后不会出现"选中 N 个但只处理了 0 个"。
@@ -593,17 +569,6 @@ export default function AliasesPage() {
           </>
         }
       />
-
-      <p className="hint-block">
-        共 {aliases.length} 个邮箱（启用 {activeCount} 个，未分组 {ungroupedCount} 个
-        {staleCount > 0 && <>，90 天未收信 {staleCount} 个</>}）。
-        邮箱地址、标签由 iCloud 决定，不可修改；分组和备注是本系统的归类信息，只存在本地。
-        {activity?.available && activity.activity.last_scan_at ? (
-          <> 收信数据更新于 {formatDate(activity.activity.last_scan_at)}（窗口 {activity.activity.window_days} 天）。</>
-        ) : (
-          <> 点「刷新收信」可读取收件箱，统计每个邮箱最近一次收到邮件的时间。</>
-        )}
-      </p>
 
       <div className="data-panel">
         <div className="toolbar">
