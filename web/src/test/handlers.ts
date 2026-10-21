@@ -24,4 +24,15 @@ export const handlers = [
   http.get('/api/groups', () =>
     HttpResponse.json({ success: true, data: { groups: [], count: 0 } }),
   ),
+  // 默认还没扫描过收信活动:页面提示"点刷新收信"
+  http.get('/api/alias-activity', () =>
+    HttpResponse.json({
+      success: true,
+      data: {
+        account_id: 'acc_1',
+        available: false,
+        activity: { account_id: 'acc_1', scanned: 0, matched: 0, window_days: 0 },
+      },
+    }),
+  ),
 ]

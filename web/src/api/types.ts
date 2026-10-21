@@ -56,7 +56,42 @@ export interface AliasMeta {
   /** 空表示未分组 */
   group_id?: string
   note?: string
+  /**
+   * 最近一次收到投递到该别名的邮件时间（RFC3339）。
+   * 由「刷新收信」扫描收件箱得出，没有记录表示还没扫到过。
+   */
+  last_received_at?: string
   updated_at?: string
+}
+
+/** 某账号最近一次收信扫描的摘要 */
+export interface AliasActivity {
+  account_id: string
+  last_scan_at?: string
+  /** 本次扫描的邮件封数 */
+  scanned: number
+  /** 命中别名的封数 */
+  matched: number
+  window_days: number
+}
+
+/** GET /api/alias-activity 的返回 */
+export interface AliasActivityResult {
+  account_id: string
+  available: boolean
+  activity: AliasActivity
+}
+
+/** POST /api/alias-activity/scan 的返回 */
+export interface ScanActivityResult {
+  account_id: string
+  method: 'imap' | 'web_api' | 'demo' | string
+  scanned: number
+  matched: number
+  /** 最近收信时间被刷新的别名数量 */
+  updated: number
+  window_days: number
+  last_scan_at: string
 }
 
 /** 分组（系统自有，非 iCloud 字段） */

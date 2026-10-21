@@ -653,3 +653,128 @@ describe('AliasesPage 批量操作', () => {
     click.mockRestore()
   })
 })
+
+describe('AliasesPage 收信活动', () => {
+  const DAY = 24 * 60 * 60 * 1000
+  const receivedAgo = (days: number) => new Date(Date.now() - days * DAY).toISOString()
+
+  function mockList(meta: Record<string, unknown>) {
+    return [
+      http.get('/api/accounts', () => HttpResponse.json({ success: true, data: accounts })),
+      http.get('/api/aliases', () =>
+        HttpResponse.json({
+          success: true,
+          data: { account_id: 'acc_1', count: aliases.length, aliases, meta },
+        }),
+      ),
+    ]
+  }
+
+  beforeEach(() => {
+    setCSRFToken('csrf-test')
+    server.resetHandlers()
+  })
+
+  it('展示最近收信相对时间,并可按「从未收信」筛选', async () => {
+    server.use(
+      ...mockList({
+        'alpha@icloud.com': { email: 'alpha@icloud.com', last_received_at: receivedAgo(3) },
+      }),
+    )
+    renderPage()
+    await screen.findByText('alpha@icloud.com')
+
+    const table = screen.getByRole('table')
+    expect(within(table).getByText('3 天前')).toBeInTheDocument()
+    // beta 没有任何记录:显示"未记录"而不是"从未收信"
+    expect(within(table).getByText('未记录')).toBeInTheDocument()
+
+    const user = userEvent.setup()
+    await user.selectOptions(screen.getByLabelText('收信'), 'never')
+    const filtered = screen.getByRole('table')
+    expect(within(filtered).queryByText('alpha@icloud.com')).toBeNull()
+    expect(within(filtered).getByText('beta@icloud.com')).toBeInTheDocument()
+  })
+
+  it('90 天未收信:头部给出数量,筛选只留久未收信的号', async () => {
+    server.use(
+      ...mockList({
+        'alpha@icloud.com': { email: 'alpha@icloud.com', last_received_at: receivedAgo(120) },
+        'beta@icloud.com': { email: 'beta@icloud.com', last_received_at: receivedAgo(5) },
+      }),
+    )
+    renderPage()
+    await screen.findByText('alpha@icloud.com')
+    expect(screen.getByText(/90 天未收信 1 个/)).toBeInTheDocument()
+
+    const user = userEvent.setup()
+    await user.selectOptions(screen.getByLabelText('收信'), 'stale90')
+    const table = screen.getByRole('table')
+    expect(within(table).getByText('alpha@icloud.com')).toBeInTheDocument()
+    expect(within(table).queryByText('beta@icloud.com')).toBeNull()
+  })
+
+  it('刷新收信:发出扫描请求并把结果写回列表', async () => {
+    let scanBody: Record<string, unknown> | null = null
+    let listCalls = 0
+    server.use(
+      http.get('/api/accounts', () => HttpResponse.json({ success: true, data: accounts })),
+      http.get('/api/aliases', () => {
+        listCalls += 1
+        // 第一次没有收信记录,扫描后再拉才带上时间
+        const meta =
+          listCalls > 1
+            ? { 'alpha@icloud.com': { email: 'alpha@icloud.com', last_received_at: receivedAgo(1) } }
+            : {}
+        return HttpResponse.json({
+          success: true,
+          data: { account_id: 'acc_1', count: aliases.length, aliases, meta },
+        })
+      }),
+      http.post('/api/alias-activity/scan', async ({ request }) => {
+        scanBody = (await request.json()) as Record<string, unknown>
+        return HttpResponse.json({
+          success: true,
+          data: {
+            account_id: 'acc_1',
+            method: 'imap',
+            scanned: 42,
+            matched: 1,
+            updated: 1,
+            window_days: 90,
+            last_scan_at: new Date().toISOString(),
+          },
+        })
+      }),
+    )
+    renderPage()
+    await screen.findByText('alpha@icloud.com')
+    // 两个号都还没有记录
+    expect(screen.getAllByText('未记录')).toHaveLength(2)
+
+    const user = userEvent.setup()
+    await user.click(screen.getByRole('button', { name: /刷新收信/ }))
+
+    expect(await screen.findByText('已扫描 42 封邮件，更新 1 个')).toBeInTheDocument()
+    expect(scanBody).toEqual({ account_id: 'acc_1' })
+    expect(await screen.findByText('昨天')).toBeInTheDocument()
+    expect(listCalls).toBeGreaterThan(1)
+  })
+
+  it('扫描失败时给出可操作的提示', async () => {
+    server.use(
+      ...mockList({}),
+      http.post('/api/alias-activity/scan', () =>
+        HttpResponse.json(
+          { success: false, code: 'VALIDATION_ERROR', message: '无可用邮件客户端' },
+          { status: 400 },
+        ),
+      ),
+    )
+    renderPage()
+    await screen.findByText('alpha@icloud.com')
+    const user = userEvent.setup()
+    await user.click(screen.getByRole('button', { name: /刷新收信/ }))
+    expect(await screen.findByRole('alert')).toHaveTextContent('无可用邮件客户端')
+  })
+})

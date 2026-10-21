@@ -4,12 +4,14 @@ import { request, ApiError } from '../api/client'
 import type {
   AccountSummary,
   Alias,
+  AliasActivityResult,
   AliasListResult,
   AliasMeta,
   BulkAliasAction,
   BulkAliasResult,
   BulkAliasTarget,
   Group,
+  ScanActivityResult,
 } from '../api/types'
 import AliasEditDialog from '../components/AliasEditDialog'
 import AsyncState from '../components/AsyncState'
@@ -29,6 +31,7 @@ import {
   IconEdit,
   IconInbox,
   IconPlus,
+  IconRefresh,
   IconSearch,
   IconTrash,
 } from '../components/icons'
@@ -38,6 +41,11 @@ type SortDirection = 'asc' | 'desc'
 /** 未分组的筛选值（分组 id 都以 g_ 开头，不会冲突） */
 const NO_GROUP = '__none__'
 const ALL_GROUPS = 'all'
+
+/** 收信状况筛选。stale30/stale90 表示"超过 N 天没有收到邮件"。 */
+type ActivityFilter = 'all' | 'never' | 'stale30' | 'stale90'
+
+const DAY_MS = 24 * 60 * 60 * 1000
 
 /** 需要二次确认的批量操作；归组是本地改动，直接执行 */
 type BulkConfirmAction = 'deactivate' | 'reactivate' | 'delete'
@@ -87,6 +95,34 @@ function dateTimestamp(raw?: string): number | null {
   return parseAliasDate(raw)?.getTime() ?? null
 }
 
+/** 把时间戳说成"3 天前 / 2 个月前"，一眼能判断这个号还活着没。 */
+function formatRelative(raw?: string): string {
+  const timestamp = dateTimestamp(raw)
+  if (timestamp === null) return ''
+  const diff = Date.now() - timestamp
+  if (diff < 0) return '刚刚'
+  const days = Math.floor(diff / DAY_MS)
+  if (days === 0) return '今天'
+  if (days === 1) return '昨天'
+  if (days < 30) return `${days} 天前`
+  if (days < 365) return `${Math.floor(days / 30)} 个月前`
+  return `${Math.floor(days / 365)} 年前`
+}
+
+/**
+ * 判断别名是否"久未收信"。
+ *
+ * 收信时间来自扫描结果，没扫到过的别名同样是空值——
+ * 所以对空值用创建时间兜底：新号还没收信很正常，老号一直没记录才值得关注。
+ */
+function isStale(alias: Alias, entry: AliasMeta | undefined, days: number): boolean {
+  const cutoff = Date.now() - days * DAY_MS
+  const received = dateTimestamp(entry?.last_received_at)
+  if (received !== null) return received < cutoff
+  const created = dateTimestamp(alias.createdAt)
+  return created !== null && created < cutoff
+}
+
 /**
  * 邮箱管理页。
  *
@@ -123,6 +159,10 @@ export default function AliasesPage() {
   const [selected, setSelected] = useState<Set<string>>(() => new Set())
   /** 批量归组的下拉值：'' 表示未选择，NO_GROUP 表示移出分组 */
   const [bulkGroup, setBulkGroup] = useState('')
+  const [activityFilter, setActivityFilter] = useState<ActivityFilter>('all')
+  // 上一次扫描的摘要（用于显示"收信数据更新于…"）
+  const [activity, setActivity] = useState<AliasActivityResult | null>(null)
+  const [scanning, setScanning] = useState(false)
 
   const [searchParams, setSearchParams] = useSearchParams()
   const groupFilter = searchParams.get('group_id') ?? ALL_GROUPS
@@ -208,6 +248,23 @@ export default function AliasesPage() {
     }
   }, [accountId, retryKey])
 
+  // 加载上一次收信扫描的摘要:用来提示"收信数据是不是旧的"
+  useEffect(() => {
+    if (!accountId) return
+    let cancelled = false
+    request<AliasActivityResult>(`/api/alias-activity?account_id=${encodeURIComponent(accountId)}`)
+      .then((data) => {
+        if (!cancelled) setActivity(data)
+      })
+      .catch(() => {
+        // 扫描摘要只是辅助信息,拿不到不影响列表本身
+        if (!cancelled) setActivity(null)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [accountId, retryKey])
+
   const groupById = useMemo(() => {
     const map = new Map<string, Group>()
     for (const group of groups) map.set(group.id, group)
@@ -226,6 +283,9 @@ export default function AliasesPage() {
         if (groupFilter !== ALL_GROUPS && groupFilter !== NO_GROUP && entry?.group_id !== groupFilter) {
           return false
         }
+        if (activityFilter === 'never' && dateTimestamp(entry?.last_received_at) !== null) return false
+        if (activityFilter === 'stale30' && !isStale(alias, entry, 30)) return false
+        if (activityFilter === 'stale90' && !isStale(alias, entry, 90)) return false
         if (!q) return true
         return (
           alias.email.toLowerCase().includes(q) ||
@@ -246,7 +306,7 @@ export default function AliasesPage() {
         return sortDirection === 'asc' ? leftTime - rightTime : rightTime - leftTime
       })
       .map(({ alias }) => alias)
-  }, [aliases, meta, search, filter, groupFilter, sortDirection])
+  }, [aliases, meta, search, filter, groupFilter, activityFilter, sortDirection])
 
   // 当前页的数据切片(过滤+排序之后)
   const safePage = Math.min(page, Math.max(1, Math.ceil(filtered.length / pageSize)))
@@ -254,6 +314,7 @@ export default function AliasesPage() {
 
   const activeCount = aliases.filter((a) => a.active).length
   const ungroupedCount = aliases.filter((a) => !meta[a.email.toLowerCase()]?.group_id).length
+  const staleCount = aliases.filter((a) => isStale(a, meta[a.email.toLowerCase()], 90)).length
 
   // 选中集合里可能残留上一次操作删掉的 ID，统一用当前列表过滤一遍再使用，
   // 这样切换账号/刷新后不会出现"选中 N 个但只处理了 0 个"。
@@ -339,6 +400,28 @@ export default function AliasesPage() {
     }
   }
 
+  /** 扫描收件箱，刷新每个别名的最近收信时间。 */
+  async function scanActivity() {
+    if (!accountId || scanning) return
+    setScanning(true)
+    setActionError('')
+    try {
+      const result = await request<ScanActivityResult>('/api/alias-activity/scan', {
+        method: 'POST',
+        body: JSON.stringify({ account_id: accountId }),
+      })
+      const updated = result.updated > 0 ? `更新 ${result.updated} 个` : '没有新的收信时间'
+      show(`已扫描 ${result.scanned} 封邮件，${updated}`)
+      setRetryKey((k) => k + 1)
+    } catch (err) {
+      setActionError(
+        err instanceof ApiError ? err.message : '扫描失败，请检查账号是否配置了 App 专用密码或 Cookie',
+      )
+    } finally {
+      setScanning(false)
+    }
+  }
+
   /** 导出当前筛选结果（不是仅当前页），方便对账、迁移或给表格软件分析。 */
   function exportCSV() {
     if (filtered.length === 0) {
@@ -347,7 +430,7 @@ export default function AliasesPage() {
     }
     const accountName = accounts.find((a) => a.id === accountId)?.name ?? accountId
     const rows = [
-      ['邮箱', '标签', '分组', '备注', '状态', '创建时间', '账号'],
+      ['邮箱', '标签', '分组', '备注', '状态', '最近收信', '创建时间', '账号'],
       ...filtered.map((alias) => {
         const entry = meta[alias.email.toLowerCase()]
         const group = entry?.group_id ? groupById.get(entry.group_id) : undefined
@@ -357,6 +440,7 @@ export default function AliasesPage() {
           group?.name ?? '未分组',
           entry?.note ?? '',
           alias.active ? '已启用' : '已停用',
+          entry?.last_received_at ? formatDate(entry.last_received_at) : '',
           formatDate(alias.createdAt),
           accountName,
         ]
@@ -467,6 +551,14 @@ export default function AliasesPage() {
         title="邮箱管理"
         actions={
           <>
+            <button
+              onClick={() => void scanActivity()}
+              disabled={!accountId || scanning}
+              title="读取收件箱，统计每个邮箱最近一次收到邮件的时间"
+            >
+              <IconRefresh size={16} />
+              {scanning ? '扫描中…' : '刷新收信'}
+            </button>
             <button onClick={exportCSV} disabled={filtered.length === 0} title="导出当前筛选结果">
               <IconDownload size={16} />
               导出 CSV
@@ -503,8 +595,14 @@ export default function AliasesPage() {
       />
 
       <p className="hint-block">
-        共 {aliases.length} 个邮箱（启用 {activeCount} 个，未分组 {ungroupedCount} 个）。
+        共 {aliases.length} 个邮箱（启用 {activeCount} 个，未分组 {ungroupedCount} 个
+        {staleCount > 0 && <>，90 天未收信 {staleCount} 个</>}）。
         邮箱地址、标签由 iCloud 决定，不可修改；分组和备注是本系统的归类信息，只存在本地。
+        {activity?.available && activity.activity.last_scan_at ? (
+          <> 收信数据更新于 {formatDate(activity.activity.last_scan_at)}（窗口 {activity.activity.window_days} 天）。</>
+        ) : (
+          <> 点「刷新收信」可读取收件箱，统计每个邮箱最近一次收到邮件的时间。</>
+        )}
       </p>
 
       <div className="data-panel">
@@ -556,6 +654,23 @@ export default function AliasesPage() {
               <option value="all">全部</option>
               <option value="active">已启用</option>
               <option value="inactive">已停用</option>
+            </select>
+          </div>
+          <div className="toolbar-field">
+            <label htmlFor="alias-activity-filter">收信</label>
+            <select
+              id="alias-activity-filter"
+              value={activityFilter}
+              onChange={(e) => {
+                setActivityFilter(e.target.value as ActivityFilter)
+                setPage(1)
+              }}
+              style={{ width: 'auto' }}
+            >
+              <option value="all">全部</option>
+              <option value="never">从未收信</option>
+              <option value="stale30">30 天未收信</option>
+              <option value="stale90">90 天未收信</option>
             </select>
           </div>
         </div>
@@ -634,6 +749,7 @@ export default function AliasesPage() {
                   <th>标签</th>
                   <th>分组</th>
                   <th>状态</th>
+                  <th>最近收信</th>
                   <th aria-sort={sortDirection === 'asc' ? 'ascending' : 'descending'}>
                     <button
                       type="button"
@@ -691,6 +807,20 @@ export default function AliasesPage() {
                           {alias.active ? <IconCheck size={12} /> : <IconClock size={12} />}
                           {alias.active ? '已启用' : '已停用'}
                         </span>
+                      </td>
+                      <td>
+                        {entry?.last_received_at ? (
+                          <span
+                            className={isStale(alias, entry, 90) ? 'cell-stale' : undefined}
+                            title={formatDate(entry.last_received_at)}
+                          >
+                            {formatRelative(entry.last_received_at)}
+                          </span>
+                        ) : (
+                          <span className="cell-muted" title="尚未扫描到投递到该邮箱的邮件">
+                            未记录
+                          </span>
+                        )}
                       </td>
                       <td>{formatDate(alias.createdAt)}</td>
                       <td>

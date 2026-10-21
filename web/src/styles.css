@@ -1936,3 +1936,9 @@ tbody tr.row-selected:hover {
   padding: 0 10px;
   font-size: var(--text-xs);
 }
+
+/* ─── 收信活动:久未收信的弱提示 ─── */
+.cell-stale {
+  color: var(--color-warning, #b45309);
+  font-weight: 500;
+}
