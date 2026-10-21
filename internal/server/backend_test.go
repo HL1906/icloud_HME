@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -17,6 +18,9 @@ import (
 
 // fakeBackend 是测试用内存 Backend,记录调用,不访问网络。
 type fakeBackend struct {
+	// bulk 操作会并发调用本类型,记录字段需要加锁
+	mu sync.Mutex
+
 	accounts []account.Summary
 	aliases  []hme.Alias
 	inbox    InboxResult
@@ -42,6 +46,8 @@ type fakeBackend struct {
 	aliasActErr    error
 	aliasDeleteID  string
 	aliasDeleteErr error
+	// aliasFailIDs 让指定 anonymousID 的别名操作失败,用于批量部分失败用例
+	aliasFailIDs map[string]error
 	listInboxQuery InboxQuery
 	reloadCount    int
 
@@ -130,12 +136,22 @@ func (f *fakeBackend) ListAliases(accountID string) ([]hme.Alias, error) {
 }
 
 func (f *fakeBackend) SetAliasActive(accountID, anonymousID string, active bool) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.aliasActID, f.aliasActActive = anonymousID, active
+	if err := f.aliasFailIDs[anonymousID]; err != nil {
+		return false, err
+	}
 	return true, f.aliasActErr
 }
 
 func (f *fakeBackend) DeleteAlias(accountID, anonymousID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.aliasDeleteID = anonymousID
+	if err := f.aliasFailIDs[anonymousID]; err != nil {
+		return err
+	}
 	return f.aliasDeleteErr
 }
 

@@ -104,6 +104,8 @@ type Backend interface {
 type managerBackend struct {
 	mgr     *account.Manager
 	forward *forward.Store // "已转发"标记,可为 nil(禁用去重)
+	// demo 非 nil 时,别名接口改走内存假数据,不触碰真实 iCloud 账号。
+	demo *demoStore
 
 	// aliasCache 缓存别名列表,用于转发接口的归属校验,避免每次轮询都打上游。
 	aliasMu    sync.Mutex
@@ -249,6 +251,10 @@ func (b *managerBackend) RemoveAccount(id string) (bool, error) {
 
 // CreateAlias 创建 HME 别名。
 func (b *managerBackend) CreateAlias(accountID, label string) (*hme.CreateResult, error) {
+	// 演示模式:在内存里造一条,不消耗真实 iCloud 的别名额度
+	if b.demo != nil {
+		return b.demo.create(label), nil
+	}
 	client, err := b.mgr.HMEClient(accountID, false)
 	if err != nil {
 		return nil, mapAccountErr(err)
@@ -264,6 +270,10 @@ func (b *managerBackend) CreateAlias(accountID, label string) (*hme.CreateResult
 
 // ListAliases 列出账号的 HME 别名。
 func (b *managerBackend) ListAliases(accountID string) ([]hme.Alias, error) {
+	// 演示模式:账号没配凭据也能看到完整列表,便于确认字段与交互
+	if b.demo != nil {
+		return b.demo.list(), nil
+	}
 	client, err := b.mgr.HMEClient(accountID, false)
 	if err != nil {
 		return nil, mapAccountErr(err)
@@ -278,6 +288,9 @@ func (b *managerBackend) ListAliases(accountID string) ([]hme.Alias, error) {
 
 // SetAliasActive 停用或激活别名。
 func (b *managerBackend) SetAliasActive(accountID, anonymousID string, active bool) (bool, error) {
+	if b.demo != nil {
+		return b.demo.setActive(anonymousID, active), nil
+	}
 	client, err := b.mgr.HMEClient(accountID, false)
 	if err != nil {
 		return false, mapAccountErr(err)
@@ -303,6 +316,12 @@ func (b *managerBackend) SetAliasActive(accountID, anonymousID string, active bo
 
 // DeleteAlias 删除别名。
 func (b *managerBackend) DeleteAlias(accountID, anonymousID string) error {
+	if b.demo != nil {
+		if !b.demo.remove(anonymousID) {
+			return &BackendError{Status: http.StatusNotFound, Code: "ALIAS_NOT_FOUND", Message: "别名不存在"}
+		}
+		return nil
+	}
 	client, err := b.mgr.HMEClient(accountID, false)
 	if err != nil {
 		return mapAccountErr(err)

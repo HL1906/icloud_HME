@@ -21,7 +21,7 @@ HTTP JSON API，所有接口返回统一格式：
 }
 ```
 
-**稳定错误码：** `AUTH_REQUIRED`、`INVALID_CREDENTIALS`、`RATE_LIMITED`、`CSRF_INVALID`、`VALIDATION_ERROR`、`ACCOUNT_NOT_FOUND`、`OTP_REQUIRED`、`OTP_INVALID`、`UPSTREAM_UNAUTHORIZED`、`UPSTREAM_FAILURE`、`INTERNAL_ERROR`
+**稳定错误码：** `AUTH_REQUIRED`、`INVALID_CREDENTIALS`、`RATE_LIMITED`、`CSRF_INVALID`、`VALIDATION_ERROR`、`ACCOUNT_NOT_FOUND`、`OTP_REQUIRED`、`OTP_INVALID`、`UPSTREAM_UNAUTHORIZED`、`UPSTREAM_FAILURE`、`INTERNAL_ERROR`、`STORAGE_FAILURE`、`GROUP_NOT_FOUND`、`GROUP_NAME_TAKEN`、`POOL_UNAVAILABLE`、`POOL_NOT_CONFIGURED`、`POOL_BUSY`
 
 **安全约定：**
 
@@ -264,11 +264,12 @@ X-CSRF-Token: <token>
 POST /api/create
 X-CSRF-Token: <token>
 
-{"account_id": "acc_1", "label": "注册某网站"}
+{"account_id": "acc_1", "label": "注册某网站", "group_id": "g_7f3a1c"}
 ```
 
 - `account_id` 必填
-- `label` 可选，最长 200 字符
+- `label` 可选，最长 200 字符。**这是 iCloud 原生字段**：传空时 iCloud 会记为 `Created 2026-10-21 17:05`；写入后不可修改。
+- `group_id` 可选，本系统的分组 ID（见「分组」一节）。分组不会写到 iCloud；先校验存在，再创建别名，避免白耗一个别名额度。
 
 **响应：**
 
@@ -279,10 +280,13 @@ X-CSRF-Token: <token>
     "email": "xyz123@icloud.com",
     "label": "注册某网站",
     "created_at": "2026-01-15T10:30:00+08:00",
-    "account_id": "acc_1"
+    "account_id": "acc_1",
+    "group_id": "g_7f3a1c"
   }
 }
 ```
+
+新创建的别名在 iCloud 侧**默认就是启用状态**，无需额外调用激活接口。`created_at` 是调用创建接口的当时时间（RFC3339）。
 
 ### 13. 读取邮件
 
@@ -478,10 +482,21 @@ GET /api/aliases?account_id=acc_1
         "active": true,
         "createdAt": "2026-01-15T10:30:00Z"
       }
-    ]
+    ],
+    "meta": {
+      "xyz123@icloud.com": {
+        "email": "xyz123@icloud.com",
+        "account_id": "acc_1",
+        "group_id": "g_7f3a1c",
+        "note": "注册试用",
+        "updated_at": "2026-10-21T17:00:00+08:00"
+      }
+    }
   }
 }
 ```
+
+`meta` 是本系统的本地元数据（分组/备注），key 为小写邮箱；没有本地元数据的别名不会出现在这里。
 
 ### 15. 停用/激活/删除别名
 
@@ -496,7 +511,56 @@ X-CSRF-Token: <token>
 
 - `:id` 为别名的 `anonymousId`，非空且 URL 解码后不超过 256 字符
 - `account_id` 必填
+- `email` 可选：只在 `DELETE` 时有意义，传了会顺带清掉该别名的本地分组/备注
 - 删除不可恢复；直接删除失败时会先停用再删
+
+### 15.1. 批量操作别名
+
+```http
+POST /api/alias-bulk
+X-CSRF-Token: <token>
+
+{
+  "account_id": "acc_1",
+  "action": "deactivate",
+  "group_id": "",
+  "aliases": [
+    {"anonymous_id": "anon_1", "email": "a@icloud.com"},
+    {"anonymous_id": "anon_2", "email": "b@icloud.com"}
+  ]
+}
+```
+
+| 字段 | 说明 |
+|---|---|
+| `account_id` | 必填 |
+| `action` | `deactivate` / `reactivate` / `delete` / `assign_group` |
+| `aliases` | 1–200 条；`email` 在 `delete`（清理本地元数据）与 `assign_group` 时必填 |
+| `group_id` | 仅 `assign_group` 使用，空串表示移出分组（备注保留） |
+
+**响应：**
+
+```json
+{
+  "success": true,
+  "data": {
+    "action": "deactivate",
+    "total": 2,
+    "applied": 1,
+    "succeeded": 1,
+    "failed": 1,
+    "results": [
+      {"anonymous_id": "anon_1", "email": "a@icloud.com", "ok": true},
+      {"anonymous_id": "anon_2", "email": "b@icloud.com", "ok": false, "error": "上游返回 500"}
+    ]
+  }
+}
+```
+
+- `results` 顺序与请求一致，便于前端按行回显。
+- `deactivate` / `reactivate` / `delete` 逐条调用 iCloud（服务端最多 4 并发），单条失败不影响其余；`assign_group` 只改本地 `alias_meta.json`，整批一次落盘。
+- 整批参数非法（缺 `account_id`、动作取值错误、超过 200 条、归组缺 `email`）返回 `400 VALIDATION_ERROR`；归入不存在的分组返回 `404 GROUP_NOT_FOUND`。
+- 缺少 `anonymous_id` 的条目单独失败（`error` 说明原因），不会让整批报错。
 
 ### 16. 重新加载配置
 
@@ -506,6 +570,223 @@ X-CSRF-Token: <token>
 ```
 
 重新读取 `accounts.json`。
+
+### 17. 运行模式信息
+
+```http
+GET /api/meta
+```
+
+**响应：**
+
+```json
+{
+  "success": true,
+  "data": { "demo": true, "version": "dev" }
+}
+```
+
+`demo=true` 表示服务以 `-demo`（或 `ICLOUD_HME_DEMO=1`）启动：别名相关接口返回进程内存假数据，`/api/create` 不会在真实 iCloud 账号上创建别名。自动化脚本应先探测该字段，避免把演示结果当成真实邮箱。
+
+---
+
+## 别名池自动补号
+
+后台按账号盯着别名数量，低于目标就自动创建补齐。配置存在数据目录的 `alias_pool.json`，与 `accounts.json` 解耦。
+
+**硬性约束（防止把上游打爆）：**
+
+- 单轮最多创建 `max_per_run` 个，不会一次补几百个
+- 两次创建之间强制间隔 3 秒
+- 连续失败 3 次自动暂停，需重新保存配置解除
+- 同一账号绝不并发检查
+
+### 18. 查询补号配置
+
+```http
+GET /api/pool
+```
+
+**响应：** `{"configs": [PoolConfig]}`，未配置账号不出现在列表中。功能未启用（无数据目录）返回 `503 POOL_UNAVAILABLE`。
+
+```json
+{
+  "account_id": "acc_3",
+  "enabled": true,
+  "target": 20,
+  "count_mode": "active",
+  "max_per_run": 3,
+  "interval_sec": 300,
+  "group_id": "g_7f3a1c",
+  "last_check_at": "2026-10-21T16:57:11+08:00",
+  "last_created_at": "2026-10-21T16:57:11+08:00",
+  "last_created": 3,
+  "total_created": 17,
+  "paused": false,
+  "last_error": ""
+}
+```
+
+### 19. 保存补号配置
+
+```http
+PUT /api/pool/:account_id
+X-CSRF-Token: <token>
+```
+
+```json
+{
+  "enabled": true,
+  "target": 20,
+  "count_mode": "active",
+  "max_per_run": 3,
+  "interval_sec": 300,
+  "group_id": "g_7f3a1c"
+}
+```
+
+| 字段 | 取值 | 说明 |
+|---|---|---|
+| `enabled` | bool | 是否启用 |
+| `target` | 1–200 | 目标数量 |
+| `count_mode` | `active` / `all` | `active`（默认）只算启用中的别名；`all` 连停用的一起算 |
+| `max_per_run` | 1–10 | 单轮最多创建数，默认 3 |
+| `interval_sec` | 60–86400 | 检查间隔，默认 300 |
+| `group_id` | 分组 ID 或空 | 自动创建的别名归入哪个本地分组；空表示不分组 |
+
+自动补号创建别名时**不传 `label`**：标签是 iCloud 侧字段，自动创建一律留空由 iCloud 补默认值，归类完全靠本地 `group_id`（分组只存在本系统，不会写到 iCloud）。
+
+保存会清除自动暂停标记与失败计数（视为人工确认）。账号不存在或参数越界返回 `400 VALIDATION_ERROR`。
+
+### 20. 立即补齐一次
+
+```http
+POST /api/pool/:account_id/run
+X-CSRF-Token: <token>
+```
+
+异步执行，立即返回 `{"triggered": true}`；补齐结果通过 `GET /api/pool` 的 `last_created` / `last_error` 观察。该账号正在检查时返回 `409 POOL_BUSY`。
+
+### 21. 停止自动补号
+
+```http
+DELETE /api/pool/:account_id
+X-CSRF-Token: <token>
+```
+
+删除配置并停止调度。未配置返回 `404 POOL_NOT_CONFIGURED`。
+
+---
+
+## 分组与别名元数据（本系统自有）
+
+iCloud 只提供「邮箱 + 标签 + 是否启用 + 创建时间」四个字段，其中标签创建后不可修改，也没有分组的概念。
+
+因此本系统额外维护一层**纯本地**的元数据（存在数据目录的 `alias_meta.json`）：
+
+- 分组（`group`）：给邮箱归类，方便自己管理；删账号/删邮箱都不影响 Apple 侧设置
+- 备注（`note`）：这个邮箱当初是干什么用的
+
+「编辑邮箱」编辑的就是这两项 —— 邮箱地址由 iCloud 分配，标签由创建时写入，都不能改。
+
+### 22. 列出分组
+
+```http
+GET /api/groups
+```
+
+```json
+{
+  "success": true,
+  "data": {
+    "groups": [
+      {
+        "id": "g_7f3a1c",
+        "name": "购物",
+        "color": "amber",
+        "note": "只在购物站注册用",
+        "created_at": "2026-10-01T10:00:00+08:00",
+        "alias_count": 3
+      }
+    ],
+    "count": 1
+  }
+}
+```
+
+`alias_count` 是本系统登记在该分组下的别名数量（不是 iCloud 全量统计）。
+
+### 23. 新建分组
+
+```http
+POST /api/groups
+X-CSRF-Token: <token>
+
+{"name": "购物", "color": "amber", "note": "只在购物站注册用"}
+```
+
+- `name` 必填，去空格后 1–40 字符，忽略大小写判重
+- `color` 可选，默认 `blue`；可选值 `blue` / `teal` / `green` / `amber` / `rose` / `purple` / `slate`
+- `note` 可选，≤200 字符
+- 分组上限 100 个
+
+重名返回 `400 GROUP_NAME_TAKEN`，空名/超长返回 `400 VALIDATION_ERROR`。
+
+### 24. 修改 / 删除分组
+
+```http
+PATCH /api/groups/:id
+X-CSRF-Token: <token>
+
+{"name": "购物网站", "color": "teal", "note": ""}
+```
+
+仅传需要改的字段（局部更新）。不存在返回 `404 GROUP_NOT_FOUND`。
+
+```http
+DELETE /api/groups/:id
+X-CSRF-Token: <token>
+```
+
+```json
+{"success": true, "data": {"deleted": true, "unassigned": 3}}
+```
+
+删除分组**不会**停用或删除任何邮箱，只把组内别名改回「未分组」，`unassigned` 为解绑数量。
+
+### 25. 查询别名元数据
+
+```http
+GET /api/alias-meta[?account_id=acc_1]
+```
+
+```json
+{
+  "success": true,
+  "data": {
+    "entries": [
+      {"email": "xyz123@icloud.com", "account_id": "acc_1", "group_id": "g_7f3a1c", "note": "注册试用", "updated_at": "2026-10-21T17:00:00+08:00"}
+    ],
+    "count": 1
+  }
+}
+```
+
+### 26. 写入 / 清除别名元数据
+
+```http
+PUT /api/alias-meta
+X-CSRF-Token: <token>
+
+{"email": "xyz123@icloud.com", "account_id": "acc_1", "group_id": "g_7f3a1c", "note": "注册试用"}
+```
+
+整体覆盖语义：`group_id` 与 `note` 都传空表示清除该别名的本地元数据。邮箱统一按小写存储，分组不存在返回 `400 GROUP_NOT_FOUND`。
+
+```http
+DELETE /api/alias-meta?email=xyz123@icloud.com
+X-CSRF-Token: <token>
+```
 
 ---
 

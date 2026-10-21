@@ -28,8 +28,10 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"icloud-hme/internal/account"
+	"icloud-hme/internal/aliasmeta"
 	"icloud-hme/internal/auth"
 	"icloud-hme/internal/forward"
+	"icloud-hme/internal/pool"
 	"icloud-hme/internal/webui"
 )
 
@@ -41,6 +43,9 @@ type Config struct {
 	SecureCookie  bool
 	// DataDir 是持久化目录(转发标记等)。为空时使用当前目录。
 	DataDir string
+	// Demo 开启演示模式:别名列表改用内存假数据,不访问 iCloud。
+	// 用于在账号尚未配置好时预览界面与调试自动化脚本。
+	Demo bool
 }
 
 // Server 封装 Gin 引擎、账号后端与认证。
@@ -50,6 +55,10 @@ type Server struct {
 	limiter *auth.Limiter
 	cfg     Config
 	r       *gin.Engine
+	// pool 是别名池自动补号调度器;初始化失败时为 nil(功能不可用,不影响主流程)
+	pool *pool.Pool
+	// meta 保存本地分组与别名备注(系统自有数据,不同步 iCloud)
+	meta *aliasmeta.Store
 }
 
 // New 创建 Server。mgr 为账号管理器,cfg 为安全配置。
@@ -61,6 +70,10 @@ func New(mgr *account.Manager, cfg Config) (*Server, error) {
 		be.forward = store
 	} else {
 		log.Printf("[server] 转发标记存储不可用,转发去重已禁用: %v", err)
+	}
+	if cfg.Demo {
+		be.demo = newDemoStore()
+		log.Printf("[server] 演示模式已开启:别名接口返回内存假数据,不会写入 iCloud 账号")
 	}
 	return newWithBackend(be, cfg)
 }
@@ -93,6 +106,31 @@ func newWithBackend(be Backend, cfg Config) (*Server, error) {
 	}
 	s.auth = authMgr
 	s.r = gin.New()
+
+	// 分组与别名备注:纯本系统数据,没有数据目录时退化为内存(重启即丢)。
+	meta, err := aliasmeta.NewStore(cfg.DataDir)
+	if err != nil {
+		log.Printf("[server] 分组存储初始化失败,分组功能降级为内存: %v", err)
+		meta, _ = aliasmeta.NewStore("")
+	}
+	s.meta = meta
+	if cfg.Demo {
+		// 演示别名是内存里的假数据,重启后邮箱名会变;旧的归属记录留着只会让分组计数虚高
+		if err := meta.ResetEntries(); err != nil {
+			log.Printf("[server] 演示模式清理别名元数据失败: %v", err)
+		}
+	}
+
+	// 别名池自动补号:配置和数据都落 DataDir。
+	// 没有数据目录就不启用,避免把 alias_pool.json 写进当前工作目录。
+	if cfg.DataDir == "" {
+		log.Printf("[server] 未配置数据目录,自动补号不可用")
+	} else if pl, perr := pool.New(cfg.DataDir, poolAdapter{be: be, meta: meta}); perr != nil {
+		log.Printf("[server] 别名池调度器初始化失败,自动补号不可用: %v", perr)
+	} else {
+		s.pool = pl
+		pl.Start()
+	}
 	// 不记录 query string:别名等隐私信息不应进入访问日志
 	s.r.Use(gin.LoggerWithFormatter(redactedLogFormatter), gin.Recovery(),
 		securityHeadersWithHSTS(cfg.SecureCookie), bodyLimitMiddleware())
@@ -167,6 +205,16 @@ func (s *Server) Run(addr string) error {
 // Handler 返回底层 gin 引擎(便于测试)。
 func (s *Server) Handler() http.Handler { return s.r }
 
+// Close 停止 Server 持有的后台任务。
+//
+// 目前只有补号调度器需要收尾:它可能在创建间隔里等待,
+// 不主动停会让进程退出时多等几秒。
+func (s *Server) Close() {
+	if s.pool != nil {
+		s.pool.Close()
+	}
+}
+
 func (s *Server) register() {
 	api := s.r.Group("/api")
 	api.Use(apiCacheControlMiddleware())
@@ -211,8 +259,29 @@ func (s *Server) register() {
 			authed.POST("/aliases/:id/deactivate", csrfCheck(s.auth), s.deactivateAliasHandler)
 			authed.POST("/aliases/:id/reactivate", csrfCheck(s.auth), s.reactivateAliasHandler)
 			authed.DELETE("/aliases/:id", csrfCheck(s.auth), s.deleteAliasHandler)
+			// 批量操作放在 /alias-bulk 而非 /aliases/bulk:
+			// 后者会和上面 /aliases/:id/* 的参数节点混在同一段路由树里。
+			authed.POST("/alias-bulk", csrfCheck(s.auth), s.bulkAliasHandler)
+
+			// ===== 分组(本系统自有数据,不同步 iCloud) =====
+			authed.GET("/groups", s.listGroupsHandler)
+			authed.POST("/groups", csrfCheck(s.auth), s.createGroupHandler)
+			authed.PATCH("/groups/:id", csrfCheck(s.auth), s.updateGroupHandler)
+			authed.DELETE("/groups/:id", csrfCheck(s.auth), s.deleteGroupHandler)
+
+			// ===== 别名元数据(分组/备注) =====
+			authed.GET("/alias-meta", s.listAliasMetaHandler)
+			authed.PUT("/alias-meta", csrfCheck(s.auth), s.putAliasMetaHandler)
+			authed.DELETE("/alias-meta", csrfCheck(s.auth), s.deleteAliasMetaHandler)
+
+			// ===== 别名池自动补号 =====
+			authed.GET("/pool", s.listPoolHandler)
+			authed.PUT("/pool/:id", csrfCheck(s.auth), s.updatePoolHandler)
+			authed.DELETE("/pool/:id", csrfCheck(s.auth), s.deletePoolHandler)
+			authed.POST("/pool/:id/run", csrfCheck(s.auth), s.runPoolHandler)
 
 			// ===== 系统 =====
+			authed.GET("/meta", s.handleMeta)
 			authed.POST("/reload", csrfCheck(s.auth), s.reloadConfigHandler)
 		}
 	}
@@ -250,6 +319,7 @@ var webuiFS = func() fs.FS {
 type createAliasReq struct {
 	AccountID string `json:"account_id"`
 	Label     string `json:"label"`
+	GroupID   string `json:"group_id"`
 }
 
 func (s *Server) createAliasHandler(c *gin.Context) {
@@ -262,17 +332,29 @@ func (s *Server) createAliasHandler(c *gin.Context) {
 		failCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "参数错误: label 最长 200 字符")
 		return
 	}
+	// 分组先校验:别等邮箱建好了才发现分组 ID 是错的,那已经消耗了一个别名额度
+	if req.GroupID != "" && !s.meta.GroupExists(req.GroupID) {
+		failCode(c, http.StatusBadRequest, "GROUP_NOT_FOUND", "分组不存在")
+		return
+	}
 
 	result, err := s.be.CreateAlias(req.AccountID, req.Label)
 	if err != nil {
 		backendFail(c, err)
 		return
 	}
+	if req.GroupID != "" {
+		// 归组失败不影响创建结果:邮箱已经在 iCloud 上了,用户可以再手工编辑
+		if _, gerr := s.meta.Upsert(result.Email, req.AccountID, req.GroupID, ""); gerr != nil {
+			log.Printf("[server] 新建别名归组失败 email=%s: %v", result.Email, gerr)
+		}
+	}
 	ok(c, gin.H{
 		"email":      result.Email,
 		"label":      result.Label,
 		"created_at": result.CreatedAt,
 		"account_id": req.AccountID,
+		"group_id":   req.GroupID,
 	})
 }
 
@@ -467,34 +549,48 @@ func (s *Server) listAliasesHandler(c *gin.Context) {
 		backendFail(c, err)
 		return
 	}
+	// 把本地分组/备注一起带上,省去前端再请求一次;没有元数据的别名不出现在 map 里
+	meta := make(map[string]aliasmeta.Entry, len(aliases))
+	for _, alias := range aliases {
+		if entry, ok := s.meta.Get(alias.Email); ok {
+			meta[entry.Email] = entry
+		}
+	}
 	ok(c, gin.H{
 		"account_id": accountID,
 		"count":      len(aliases),
 		"aliases":    aliases,
+		"meta":       meta,
 	})
 }
 
+// aliasActionReq 是别名操作请求体。Email 仅用于顺带清理本地元数据,可空。
 type aliasActionReq struct {
 	AccountID string `json:"account_id"`
+	Email     string `json:"email"`
 }
 
 // validateAliasAction 校验别名操作的匿名 ID 与请求体。
-func validateAliasAction(c *gin.Context) (accountID, anonymousID string, valid bool) {
+func validateAliasAction(c *gin.Context) (accountID, anonymousID, email string, valid bool) {
 	anonymousID = c.Param("id")
 	var req aliasActionReq
 	if err := c.ShouldBindJSON(&req); err != nil || req.AccountID == "" {
 		failCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "参数错误: account_id 必填")
-		return "", "", false
+		return "", "", "", false
 	}
 	if anonymousID == "" || len(anonymousID) > 256 {
 		failCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "参数错误: anonymous id 无效")
-		return "", "", false
+		return "", "", "", false
 	}
-	return req.AccountID, anonymousID, true
+	if len(req.Email) > aliasmeta.MaxEmailLen {
+		failCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "参数错误: email 无效")
+		return "", "", "", false
+	}
+	return req.AccountID, anonymousID, req.Email, true
 }
 
 func (s *Server) deactivateAliasHandler(c *gin.Context) {
-	accountID, anonymousID, valid := validateAliasAction(c)
+	accountID, anonymousID, _, valid := validateAliasAction(c)
 	if !valid {
 		return
 	}
@@ -507,7 +603,7 @@ func (s *Server) deactivateAliasHandler(c *gin.Context) {
 }
 
 func (s *Server) reactivateAliasHandler(c *gin.Context) {
-	accountID, anonymousID, valid := validateAliasAction(c)
+	accountID, anonymousID, _, valid := validateAliasAction(c)
 	if !valid {
 		return
 	}
@@ -520,13 +616,19 @@ func (s *Server) reactivateAliasHandler(c *gin.Context) {
 }
 
 func (s *Server) deleteAliasHandler(c *gin.Context) {
-	accountID, anonymousID, valid := validateAliasAction(c)
+	accountID, anonymousID, email, valid := validateAliasAction(c)
 	if !valid {
 		return
 	}
 	if err := s.be.DeleteAlias(accountID, anonymousID); err != nil {
 		backendFail(c, err)
 		return
+	}
+	// 别名已经不在 iCloud 上了,本地分组/备注一并清掉,避免元数据长期堆积
+	if email != "" {
+		if _, err := s.meta.DeleteEntry(email); err != nil {
+			log.Printf("[server] 清理别名元数据失败 email=%s: %v", email, err)
+		}
 	}
 	ok(c, gin.H{"anonymous_id": anonymousID})
 }
@@ -541,4 +643,14 @@ func (s *Server) reloadConfigHandler(c *gin.Context) {
 		return
 	}
 	ok(c, gin.H{"message": "配置已重新加载"})
+}
+
+// handleMeta 处理 GET /api/meta,返回不影响安全的运行模式信息。
+//
+// 前端据 demo 显示提示条,避免把演示数据当成真实别名操作。
+func (s *Server) handleMeta(c *gin.Context) {
+	ok(c, gin.H{
+		"demo":    s.cfg.Demo,
+		"version": "dev",
+	})
 }

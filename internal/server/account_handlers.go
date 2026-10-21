@@ -6,6 +6,7 @@ package server
 
 import (
 	"encoding/json"
+	"log"
 	"net/http"
 
 	"github.com/gin-gonic/gin"
@@ -210,6 +211,12 @@ func (s *Server) removeAccountHandler(c *gin.Context) {
 	if !found {
 		failCode(c, http.StatusNotFound, "ACCOUNT_NOT_FOUND", "账号不存在")
 		return
+	}
+	// 账号已从本系统移除,其别名的本地分组/备注也失去归属,一并清理
+	if n, merr := s.meta.DeleteByAccount(id); merr != nil {
+		log.Printf("[server] 清理账号别名元数据失败 account=%s: %v", id, merr)
+	} else if n > 0 {
+		log.Printf("[server] 已清理账号 %s 的 %d 条别名元数据", id, n)
 	}
 	ok(c, gin.H{"id": id})
 }
