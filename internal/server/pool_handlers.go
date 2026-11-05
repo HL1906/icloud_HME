@@ -3,6 +3,7 @@ package server
 import (
 	"errors"
 	"net/http"
+	"strconv"
 
 	"github.com/gin-gonic/gin"
 
@@ -45,6 +46,26 @@ func (a poolAdapter) AssignGroup(accountID, email, groupID string) error {
 	return err
 }
 
+// AliasMeta 返回统计筛选需要的本地元数据。
+func (a poolAdapter) AliasMeta(email string) (pool.Meta, bool) {
+	if a.meta == nil {
+		return pool.Meta{}, false
+	}
+	entry, ok := a.meta.Get(email)
+	if !ok {
+		return pool.Meta{}, false
+	}
+	return pool.Meta{GroupID: entry.GroupID, State: entry.State}, true
+}
+
+// GroupExists 判断分组是否还存在(筛选条件里的分组被删掉时要停下)。
+func (a poolAdapter) GroupExists(groupID string) bool {
+	if a.meta == nil {
+		return true
+	}
+	return a.meta.GroupExists(groupID)
+}
+
 // poolUnavailable 统一处理"调度器没启用"的情况。
 func (s *Server) poolUnavailable(c *gin.Context) bool {
 	if s.pool == nil {
@@ -71,6 +92,8 @@ type poolConfigReq struct {
 	IntervalSec int    `json:"interval_sec"`
 	// GroupID: 自动创建的别名归入哪个本地分组(空 = 未分组)
 	GroupID string `json:"group_id"`
+	// Filter: 统计范围。目标数量针对筛选后的结果。
+	Filter *pool.Filter `json:"filter"`
 }
 
 // updatePoolHandler 处理 PUT /api/pool/:id(新增或更新配置)。
@@ -84,6 +107,16 @@ func (s *Server) updatePoolHandler(c *gin.Context) {
 		failCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "参数错误: 请求体不是合法 JSON")
 		return
 	}
+	var filter pool.Filter
+	if req.Filter != nil {
+		filter = *req.Filter
+	}
+	// 筛选分组必须先存在:不存在的分组会让统计永远是 0,
+	// 而补出来的号又不属于它,结果就是每轮都补、永远补不满。
+	if filter.GroupID != "" && s.meta != nil && !s.meta.GroupExists(filter.GroupID) {
+		failCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "筛选条件里的分组不存在")
+		return
+	}
 	cfg, err := s.pool.Upsert(pool.Config{
 		AccountID:   id,
 		Enabled:     req.Enabled,
@@ -92,12 +125,51 @@ func (s *Server) updatePoolHandler(c *gin.Context) {
 		MaxPerRun:   req.MaxPerRun,
 		IntervalSec: req.IntervalSec,
 		GroupID:     req.GroupID,
+		Filter:      filter,
 	})
 	if err != nil {
 		failCode(c, http.StatusBadRequest, "VALIDATION_ERROR", err.Error())
 		return
 	}
 	ok(c, cfg)
+}
+
+// previewPoolHandler 处理 GET /api/pool/:id/preview。
+//
+// 只统计不创建:设置页要让用户先看清"现在有几个、会补几个"再决定保存。
+// 查询参数可选,带上就用参数试算(这样没保存的改动也能先看效果);
+// 不带则用已保存的配置,账号还没配置过时按「可用库存」口径试算。
+func (s *Server) previewPoolHandler(c *gin.Context) {
+	if s.poolUnavailable(c) {
+		return
+	}
+	id := c.Param("id")
+
+	var filter *pool.Filter
+	if _, ok := c.GetQuery("state"); ok {
+		f := pool.Filter{
+			GroupID: c.Query("group_id"),
+			State:   c.Query("state"),
+			Active:  c.Query("active"),
+		}
+		filter = &f
+	} else if _, ok := c.GetQuery("group_id"); ok {
+		f := pool.Filter{GroupID: c.Query("group_id")}
+		filter = &f
+	}
+	target := 0
+	if raw := c.Query("target"); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil {
+			target = n
+		}
+	}
+
+	preview, err := s.pool.Preview(id, filter, target)
+	if err != nil {
+		failCode(c, http.StatusInternalServerError, "POOL_ERROR", err.Error())
+		return
+	}
+	ok(c, preview)
 }
 
 // deletePoolHandler 处理 DELETE /api/pool/:id(关闭并移除配置)。

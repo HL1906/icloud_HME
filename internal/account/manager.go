@@ -38,6 +38,11 @@ type Account struct {
 	AliasTotal    int               `json:"alias_total"`
 	AliasActive   int               `json:"alias_active"`
 	LastValidated string            `json:"last_validated"`
+	// ClientID 是绑到该账号的 iCloud Web 客户端标识,首次使用时生成并落盘。
+	//
+	// 浏览器一个会话固定用一个 clientId;每次请求都换新值,等于告诉上游
+	// "同一个 Cookie 正被一串不同客户端使用"。持久化后所有请求共用一份。
+	ClientID      string            `json:"client_id,omitempty"`
 	LastError     string            `json:"last_error,omitempty"`
 	CreatedAt     string            `json:"created_at"`
 }
@@ -138,7 +143,30 @@ func NewManager(dataDir string) (*Manager, error) {
 		return nil, err
 	}
 	m.normalizeStaleStatus()
+	m.ensureClientIDs()
 	return m, nil
+}
+
+// ensureClientIDs 给尚未绑定 clientId 的账号补一个并落盘。
+//
+// 老版本每次请求都新建客户端、每次生成新 clientId,同一个 Cookie 在
+// Apple 侧会看到一串互不相同的 clientId。这里一次性补齐,之后固定不变。
+func (m *Manager) ensureClientIDs() {
+	m.mu.Lock()
+	changed := false
+	for _, acc := range m.accounts {
+		if acc.ClientID == "" {
+			acc.ClientID = uuid.New().String()
+			changed = true
+		}
+	}
+	m.mu.Unlock()
+	if !changed {
+		return
+	}
+	if err := m.save(); err != nil {
+		log.Printf("[account] 保存 clientId 失败: %v", err)
+	}
 }
 
 // Close 释放 IMAP 连接池等资源,并等待在途的后台校验收尾。
@@ -373,6 +401,7 @@ func (m *Manager) newAccount(name, icloudEmail, cookieInput, host, proxy string)
 		Proxy:       proxy,
 		Status:      status,
 		CreatedAt:   time.Now().Format(time.RFC3339),
+		ClientID:    uuid.New().String(),
 	}, nil
 }
 
@@ -498,6 +527,9 @@ func (a *Account) validateCookies() {
 		a.Status = "error"
 		a.LastError = truncate(err.Error(), 300)
 		return
+	}
+	if a.ClientID != "" {
+		client.ClientID = a.ClientID
 	}
 	if err := client.ValidateSession(); err != nil {
 		// validate 即使失败也可能通过 Set-Cookie 刷新部分会话状态。
@@ -697,7 +729,15 @@ func (m *Manager) HMEClient(id string, verbose bool) (*hme.Client, error) {
 	if len(snap.Cookies) == 0 {
 		return nil, fmt.Errorf("账号未配置 Cookie，无法使用 HME 功能")
 	}
-	return hme.NewClient(snap.Cookies, snap.Host, snap.Proxy, verbose)
+	client, err := hme.NewClient(snap.Cookies, snap.Host, snap.Proxy, verbose)
+	if err != nil {
+		return nil, err
+	}
+	// 复用账号持久化的 clientId:同一个 Cookie 必须始终搭配同一个 clientId。
+	if snap.ClientID != "" {
+		client.ClientID = snap.ClientID
+	}
+	return client, nil
 }
 
 // HMEClientWithPassword 为指定账号创建一个新的 HME 客户端,使用账号密码登录。
@@ -725,6 +765,10 @@ func (m *Manager) HMEClientWithPassword(id, password string, otpProvider hme.OTP
 	client, err := hme.NewClient(nil, snap.Host, snap.Proxy, true)
 	if err != nil {
 		return nil, err
+	}
+	// 登录也用同一个 clientId:换 clientId 等于换设备,会触发额外的 2FA 风险判定。
+	if snap.ClientID != "" {
+		client.ClientID = snap.ClientID
 	}
 
 	if err := client.Login(email, password, otpProvider); err != nil {

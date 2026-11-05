@@ -5,6 +5,10 @@
 # Runtime data
 /data/
 /logs/
+# 演示 / 临时实例的数据目录
+/demo-preview/
+/tmp-e2e/
+/tmp-sweep/
 
 # 本地 agent 工作区(含项目笔记,不入库)
 /.workbuddy/

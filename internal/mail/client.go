@@ -430,6 +430,12 @@ func (c *Client) ForEachByRecipient(recipient string, limit int, days int, onMsg
 			if ferr != nil {
 				return ferr
 			}
+			// 服务端 HEADER To 搜索是"包含"语义(不同服务器实现差异很大),
+			// 这里用本地精确地址再校验一次:按别名分发取件链接时,
+			// 一次误命中就等于把别人的邮件交出去。
+			if !RecipientMatches(m.To, recipient) {
+				continue
+			}
 			if !onMsg(m) {
 				return nil
 			}
@@ -488,7 +494,6 @@ func (c *Client) forEachRecentMatching(recipient string, limit int, days int, on
 		to   string
 	}
 	var cands []cand
-	recipient = strings.ToLower(recipient)
 	for msg := range messages {
 		if msg == nil || msg.Envelope == nil {
 			continue
@@ -501,7 +506,8 @@ func (c *Client) forEachRecentMatching(recipient string, limit int, days int, on
 			}
 			to = strings.Join(parts, ", ")
 		}
-		if !strings.Contains(strings.ToLower(to), recipient) {
+		// 精确地址匹配,不能用子串(见 RecipientMatches 的说明)
+		if !RecipientMatches(to, recipient) {
 			continue
 		}
 		if days > 0 && !msg.Envelope.Date.IsZero() {

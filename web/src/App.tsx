@@ -7,6 +7,8 @@ import DashboardPage from './pages/DashboardPage'
 import AccountsPage from './pages/AccountsPage'
 import AliasesPage from './pages/AliasesPage'
 import GroupsPage from './pages/GroupsPage'
+import TagsPage from './pages/TagsPage'
+import SettingsPage from './pages/SettingsPage'
 import InboxPage from './pages/InboxPage'
 
 function ProtectedLayout() {
@@ -32,7 +34,9 @@ export default function App() {
               <Route path="/accounts" element={<AccountsPage />} />
               <Route path="/aliases" element={<AliasesPage />} />
               <Route path="/groups" element={<GroupsPage />} />
+              <Route path="/tags" element={<TagsPage />} />
               <Route path="/inbox" element={<InboxPage />} />
+              <Route path="/settings" element={<SettingsPage />} />
               <Route path="*" element={<Navigate to="/dashboard" replace />} />
             </Route>
           </Routes>

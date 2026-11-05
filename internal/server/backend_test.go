@@ -47,7 +47,7 @@ type fakeBackend struct {
 	aliasDeleteID  string
 	aliasDeleteErr error
 	// aliasFailIDs 让指定 anonymousID 的别名操作失败,用于批量部分失败用例
-	aliasFailIDs map[string]error
+	aliasFailIDs   map[string]error
 	listInboxQuery InboxQuery
 	reloadCount    int
 
@@ -70,6 +70,14 @@ type fakeBackend struct {
 	activityDays  int
 	activityLimit int
 	activityCalls int
+
+	// 按别名取信(对外取件接口)
+	aliasMailResult    AliasMailResult
+	aliasMailErr       error
+	aliasMailAccountID string
+	aliasMailAlias     string
+	aliasMailHours     int
+	aliasMailWithBody  bool
 }
 
 func (f *fakeBackend) ListAccounts() []account.Summary { return f.accounts }
@@ -209,6 +217,19 @@ func (f *fakeBackend) FetchForForward(q ForwardQuery) (ForwardResult, error) {
 func (f *fakeBackend) MarkForwarded(accountID, alias string, ids []string, forwarded bool) (int, error) {
 	f.ackedAccountID, f.ackedAlias, f.ackedIDs, f.ackedForwarded = accountID, alias, ids, forwarded
 	return len(ids), f.ackErr
+}
+
+func (f *fakeBackend) FetchAliasMails(accountID, alias string, hours, limit int, withBody bool) (AliasMailResult, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.aliasMailAccountID = accountID
+	f.aliasMailAlias = alias
+	f.aliasMailHours = hours
+	f.aliasMailWithBody = withBody
+	if f.aliasMailErr != nil {
+		return AliasMailResult{}, f.aliasMailErr
+	}
+	return f.aliasMailResult, nil
 }
 
 func (f *fakeBackend) Reload() error {

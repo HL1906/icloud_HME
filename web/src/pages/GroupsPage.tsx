@@ -99,6 +99,11 @@ export default function GroupsPage() {
               ) : (
                 <p className="group-note group-note-empty">未填写备注</p>
               )}
+              {group.revoke_after_days ? (
+                <p className="group-note">取件链接：签发 {group.revoke_after_days} 天后自动回收</p>
+              ) : (
+                <p className="group-note group-note-empty">取件链接：不自动回收</p>
+              )}
               <div className="group-card-actions">
                 <Link className="btn-link" to={`/aliases?group_id=${encodeURIComponent(group.id)}`}>
                   查看邮箱

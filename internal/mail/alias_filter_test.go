@@ -19,11 +19,17 @@ func TestRecipientMatches(t *testing.T) {
 		{"子串不算命中", "aaa@icloud.com", "a@icloud.com", false},
 		{"收件人为空", "", "a@icloud.com", false},
 		{"别名不相关", "b@icloud.com", "a@icloud.com", false},
+		// 回归用例:这正是旧版 IMAP 回退路径用 strings.Contains 会误命中的形状,
+		// 一旦按别名对外分发取件链接,误命中就等于泄漏别人的邮件。
+		{"后缀相同不算命中", "xabc@icloud.com", "abc@icloud.com", false},
+		{"前缀相同不算命中", "abc@icloud.com.evil.example", "abc@icloud.com", false},
+		{"显示名里的别名不算命中", "abc@icloud.com <other@example.com>", "abc@icloud.com", false},
+		{"多收件人第二段命中", "a@icloud.com, b@icloud.com", "b@icloud.com", true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := recipientMatches(tt.to, tt.alias); got != tt.want {
-				t.Fatalf("recipientMatches(%q, %q) = %v, want %v", tt.to, tt.alias, got, tt.want)
+			if got := RecipientMatches(tt.to, tt.alias); got != tt.want {
+				t.Fatalf("RecipientMatches(%q, %q) = %v, want %v", tt.to, tt.alias, got, tt.want)
 			}
 		})
 	}

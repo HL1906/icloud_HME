@@ -6,7 +6,7 @@
 //
 // 几条硬性约束(都是为了别把上游打爆):
 //   - 单轮最多创建 max_per_run 个,不会一次补几百个;
-//   - 两次创建之间强制间隔(默认 3s),模拟人工节奏;
+//   - 两次创建之间随机间隔(基准 3s × 0.6–1.8),模拟人工节奏;
 //   - 连续失败 3 次自动暂停,等待人工检查凭据后恢复;
 //   - 同一账号绝不并发检查,避免重复创建。
 //
@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math/rand/v2"
 	"os"
 	"path/filepath"
 	"sort"
@@ -26,18 +27,24 @@ import (
 	"sync"
 	"time"
 
+	"icloud-hme/internal/aliasmeta"
 	"icloud-hme/internal/fsutil"
 	"icloud-hme/internal/hme"
 )
 
+// StateStock 是"库存"这个分发状态。取自 aliasmeta,避免两处字面量走样。
+const StateStock = aliasmeta.StateStock
+
 // 配置边界。超出范围一律拒绝,避免误填导致大量创建。
 const (
-	DefaultIntervalSec = 300  // 默认 5 分钟检查一次
-	MinIntervalSec     = 60   // 最快 1 分钟
+	DefaultIntervalSec = 300 // 默认 5 分钟检查一次
+	MinIntervalSec     = 60  // 最快 1 分钟
 	MaxIntervalSec     = 86400
 	DefaultMaxPerRun   = 3 // 单轮默认最多补 3 个
 	MaxPerRunLimit     = 10
 	MaxTarget          = 200
+	// DefaultTarget 是没配置过时的默认目标数量(与界面默认值保持一致)
+	DefaultTarget      = 20
 	DefaultCreateGap   = 3 * time.Second
 	maxConsecutiveFail = 3
 	// tickInterval 是调度器的心跳。单个账号是否真正检查由 interval_sec 决定,
@@ -65,6 +72,48 @@ type Backend interface {
 	// AssignGroup 把新建的别名写入本地分组。分组是本系统的概念,
 	// 自动补号创建的别名不写 iCloud 标签,只按分组归档。
 	AssignGroup(accountID, email, groupID string) error
+	// AliasMeta 返回别名的本地元数据,用于按筛选条件统计。
+	// 没有记录时 ok=false(视为未分组 + 库存)。
+	AliasMeta(email string) (Meta, bool)
+	// GroupExists 判断分组是否还存在。筛选用的分组被删掉时必须停下,
+	// 否则"符合条件的有 0 个"会变成每轮都补、永远补不满。
+	GroupExists(groupID string) bool
+}
+
+// Meta 是统计筛选需要的本地信息。
+type Meta struct {
+	GroupID string
+	State   string
+}
+
+// 筛选条件的取值。
+const (
+	// FilterStateAll 不限分发状态;FilterStateStock 只算库存(还没发出去的)。
+	//
+	// 只允许这两种:新补的邮箱必然是库存,若允许"已分发/已回收",
+	// 补出来的号永远不满足条件,会变成无限创建。
+	FilterStateAll   = "all"
+	FilterStateStock = "stock"
+	// FilterActiveAll 不限启用状态;FilterActiveOn 只算启用中的。
+	// 同理,新补的号一定是启用状态。
+	FilterActiveAll = "all"
+	FilterActiveOn  = "active"
+)
+
+// Filter 决定「统计哪些别名」。
+//
+// 目标数量针对的是筛选后的结果,而不是账号下全部别名——
+// 这样才能表达"让『试用客户』这组库存保持 20 个"这种需求。
+//
+// 刻意不提供按 iCloud 标签筛选:标签是创建时写死的字段,而自动补号
+// 不写标签,按标签统计会导致补出来的号不计入、每轮重复补。
+type Filter struct {
+	// GroupID 限定统计分组(空 = 不限)。
+	GroupID string `json:"group_id,omitempty"`
+	// State 限定分发状态:all(默认) | stock。
+	State string `json:"state,omitempty"`
+	// Active 限定启用状态:all | active(默认)。
+	Active string `json:"active,omitempty"`
 }
 
 // Config 是单账号的补号配置 + 运行状态。
@@ -74,16 +123,23 @@ type Config struct {
 	AccountID   string `json:"account_id"`
 	Enabled     bool   `json:"enabled"`
 	Target      int    `json:"target"`
-	CountMode   string `json:"count_mode"` // active(默认) | all
 	MaxPerRun   int    `json:"max_per_run"`
 	IntervalSec int    `json:"interval_sec"`
 	// GroupID 是新建别名自动归入的本地分组(可空 = 未分组)。
 	// 自动创建不写 iCloud 标签,分组只存在本系统的 alias_meta.json 里。
 	GroupID string `json:"group_id,omitempty"`
+	// Filter 是统计范围。默认(全空)等于"账号下所有启用中的别名",
+	// 与旧版的 count_mode=active 等价。
+	Filter Filter `json:"filter"`
+	// CountMode 是 Filter.Active 的旧名字,仅为兼容旧配置文件保留:
+	// 载入时并入 Filter.Active,保存时不再写出。
+	CountMode string `json:"count_mode,omitempty"`
 
-	LastCheckAt         string `json:"last_check_at,omitempty"`
-	LastCreatedAt       string `json:"last_created_at,omitempty"`
-	LastCreated         int    `json:"last_created,omitempty"`
+	LastCheckAt   string `json:"last_check_at,omitempty"`
+	LastCreatedAt string `json:"last_created_at,omitempty"`
+	LastCreated   int    `json:"last_created,omitempty"`
+	// LastCurrent 是上次检查时"符合筛选条件"的数量,设置页据此显示 N / 目标。
+	LastCurrent         int    `json:"last_current,omitempty"`
 	LastError           string `json:"last_error,omitempty"`
 	TotalCreated        int    `json:"total_created"`
 	ConsecutiveFailures int    `json:"consecutive_failures,omitempty"`
@@ -98,6 +154,28 @@ type Result struct {
 	Created   int      `json:"created"`
 	Emails    []string `json:"emails,omitempty"`
 	Error     string   `json:"error,omitempty"`
+}
+
+// Breakdown 是账号下别名的分发状态分布,用于"我现在还剩多少库存"。
+//
+// Stock 是还没发出去的,Issued 是已经发出去的,Revoked 是链接已回收的;
+// Inactive 单独统计,因为它可能是库存也可能是已分发,看的是 iCloud 侧启用状态。
+type Breakdown struct {
+	Stock    int `json:"stock"`
+	Issued   int `json:"issued"`
+	Revoked  int `json:"revoked"`
+	Inactive int `json:"inactive"`
+	Total    int `json:"total"`
+}
+
+// Preview 是"如果现在跑一轮会怎样"的试算结果,只读,不创建任何别名。
+type Preview struct {
+	AccountID string    `json:"account_id"`
+	Current   int       `json:"current"`
+	Target    int       `json:"target"`
+	ToCreate  int       `json:"to_create"`
+	Breakdown Breakdown `json:"breakdown"`
+	Error     string    `json:"error,omitempty"`
 }
 
 // Pool 是线程安全的补号调度器。
@@ -255,19 +333,28 @@ func (p *Pool) CheckOnce(accountID string) (Result, error) {
 	res := Result{AccountID: accountID, Target: snap.Target}
 	failMsg := ""
 
-	aliases, err := p.be.ListAliases(accountID)
-	if err != nil {
-		failMsg = "读取别名列表失败: " + err.Error()
-		p.record(accountID, 0, failMsg)
+	// 筛选用的分组被删掉时必须停下来:否则"符合条件 0 个"会变成
+	// 每轮都补、永远补不满的无限创建。
+	if snap.Filter.GroupID != "" && !p.be.GroupExists(snap.Filter.GroupID) {
+		failMsg = "筛选条件里的分组已不存在，请重新选择"
+		p.record(accountID, res.Current, 0, failMsg)
 		res.Error = failMsg
 		return res, nil
 	}
 
-	res.Current = countAliases(aliases, snap.CountMode)
+	aliases, err := p.be.ListAliases(accountID)
+	if err != nil {
+		failMsg = "读取别名列表失败: " + err.Error()
+		p.record(accountID, res.Current, 0, failMsg)
+		res.Error = failMsg
+		return res, nil
+	}
+
+	res.Current = p.countMatching(aliases, snap.Filter)
 	gap := snap.Target - res.Current
 	if gap <= 0 {
 		// 已达标:清掉历史错误,方便前端显示"正常"
-		p.record(accountID, 0, "")
+		p.record(accountID, res.Current, 0, "")
 		return res, nil
 	}
 
@@ -283,7 +370,7 @@ func (p *Pool) CheckOnce(accountID string) (Result, error) {
 		if p.ctx.Err() != nil {
 			break
 		}
-		if i > 0 && !sleepCtx(p.ctx, p.createGap) {
+		if i > 0 && !sleepCtx(p.ctx, p.nextCreateGap()) {
 			break
 		}
 		created, cerr := p.be.CreateAlias(accountID, "")
@@ -308,13 +395,105 @@ func (p *Pool) CheckOnce(accountID string) (Result, error) {
 		log.Printf("[pool] 自动补号 account=%s 新增=%d 当前≈%d 目标=%d",
 			accountID, res.Created, res.Current+res.Created, snap.Target)
 	}
-	p.record(accountID, res.Created, failMsg)
+	p.record(accountID, res.Current, res.Created, failMsg)
 	res.Error = failMsg
 	return res, nil
 }
 
+// Preview 试算一轮的结果:只统计、不创建。
+//
+// filter 为 nil 表示用已保存配置里的筛选条件;target<=0 表示用已保存的目标。
+// 未配置的账号也能试算(按「可用库存」口径 + 默认目标),这样新建规则时
+// 保存前就能看到"现在有几个、会补几个"。
+func (p *Pool) Preview(accountID string, filter *Filter, target int) (Preview, error) {
+	p.mu.Lock()
+	stored, ok := p.configs[accountID]
+	var snap Config
+	if ok {
+		snap = *stored
+	}
+	p.mu.Unlock()
+
+	if filter != nil {
+		snap.Filter = *filter
+	} else if !ok {
+		snap.Filter = Filter{State: FilterStateStock, Active: FilterActiveOn}
+	}
+	if target > 0 {
+		snap.Target = target
+	} else if !ok {
+		snap.Target = DefaultTarget
+	}
+
+	out := Preview{AccountID: accountID, Target: snap.Target}
+	// 试算也走一遍校验:非法筛选条件不该拖到保存时才报错。
+	// MaxPerRun/IntervalSec 传默认值,避免被无关字段的校验拦下。
+	checked, err := validate(Config{
+		AccountID:   accountID,
+		Target:      snap.Target,
+		MaxPerRun:   DefaultMaxPerRun,
+		IntervalSec: DefaultIntervalSec,
+		Filter:      snap.Filter,
+	})
+	if err != nil {
+		out.Error = err.Error()
+		return out, nil
+	}
+	snap.Filter = checked.Filter
+	if snap.Filter.GroupID != "" && !p.be.GroupExists(snap.Filter.GroupID) {
+		out.Error = "筛选条件里的分组已不存在，请重新选择"
+		return out, nil
+	}
+	aliases, err := p.be.ListAliases(accountID)
+	if err != nil {
+		out.Error = "读取别名列表失败: " + err.Error()
+		return out, nil
+	}
+	out.Current = p.countMatching(aliases, snap.Filter)
+	out.Breakdown = p.breakdown(aliases)
+
+	gap := snap.Target - out.Current
+	if gap <= 0 {
+		return out, nil
+	}
+	limit := snap.MaxPerRun
+	if limit <= 0 {
+		limit = DefaultMaxPerRun
+	}
+	if gap > limit {
+		gap = limit
+	}
+	out.ToCreate = gap
+	return out, nil
+}
+
+// breakdown 统计账号下各分发状态的别名数量。
+func (p *Pool) breakdown(aliases []hme.Alias) Breakdown {
+	var b Breakdown
+	b.Total = len(aliases)
+	for _, a := range aliases {
+		if !a.Active {
+			b.Inactive++
+		}
+		meta, ok := p.be.AliasMeta(a.Email)
+		state := meta.State
+		if !ok {
+			state = StateStock
+		}
+		switch state {
+		case aliasmeta.StateIssued:
+			b.Issued++
+		case aliasmeta.StateRevoked:
+			b.Revoked++
+		default:
+			b.Stock++
+		}
+	}
+	return b
+}
+
 // record 把一次检查的结果写回配置并落盘。
-func (p *Pool) record(accountID string, created int, errMsg string) {
+func (p *Pool) record(accountID string, current, created int, errMsg string) {
 	p.mu.Lock()
 	cur, ok := p.configs[accountID]
 	if !ok {
@@ -323,6 +502,7 @@ func (p *Pool) record(accountID string, created int, errMsg string) {
 	}
 	now := p.now().Format(time.RFC3339)
 	cur.LastCheckAt = now
+	cur.LastCurrent = current
 	cur.LastCreated = created
 	if created > 0 {
 		cur.LastCreatedAt = now
@@ -470,11 +650,16 @@ func validate(cfg Config) (Config, error) {
 	if cfg.Target < 1 || cfg.Target > MaxTarget {
 		return Config{}, fmt.Errorf("目标数量需在 1–%d 之间", MaxTarget)
 	}
-	if cfg.CountMode == "" {
-		cfg.CountMode = "active"
-	}
-	if cfg.CountMode != "active" && cfg.CountMode != "all" {
-		return Config{}, errors.New("count_mode 只能是 active 或 all")
+	// 旧配置的 count_mode 并入 Filter.Active:active → 只算已启用,all → 不限。
+	if cfg.CountMode != "" && cfg.Filter.Active == "" {
+		switch cfg.CountMode {
+		case "active":
+			cfg.Filter.Active = FilterActiveOn
+		case "all":
+			cfg.Filter.Active = FilterActiveAll
+		default:
+			return Config{}, errors.New("count_mode 只能是 active 或 all")
+		}
 	}
 	if cfg.MaxPerRun == 0 {
 		cfg.MaxPerRun = DefaultMaxPerRun
@@ -492,24 +677,87 @@ func validate(cfg Config) (Config, error) {
 	if len(cfg.GroupID) > 64 {
 		return Config{}, errors.New("分组标识无效")
 	}
+
+	// 筛选条件归一化:空值等于"不限",这样旧配置(没有 filter 字段)行为不变。
+	cfg.Filter.GroupID = strings.TrimSpace(cfg.Filter.GroupID)
+	if len(cfg.Filter.GroupID) > 64 {
+		return Config{}, errors.New("筛选分组标识无效")
+	}
+	switch cfg.Filter.State {
+	case "":
+		cfg.Filter.State = FilterStateAll
+	case FilterStateAll, FilterStateStock:
+	default:
+		return Config{}, errors.New("分发状态只能选「全部」或「库存」")
+	}
+	switch cfg.Filter.Active {
+	case "":
+		cfg.Filter.Active = FilterActiveAll
+	case FilterActiveAll, FilterActiveOn:
+	default:
+		return Config{}, errors.New("启用状态只能选「全部」或「已启用」")
+	}
+	// 按分组统计时,新邮箱必须也进这个分组,否则补出来的号不计入筛选、
+	// 每轮都会继续补(无限创建)。
+	if cfg.Filter.GroupID != "" {
+		cfg.GroupID = cfg.Filter.GroupID
+	}
+	// 旧字段并入新字段后就不再写出,避免两处取值打架。
+	cfg.CountMode = ""
 	return cfg, nil
 }
 
-// countAliases 按配置口径统计当前数量。
-//
-// 默认只算启用中的别名:停用的不该计入"可用池",
-// 否则池子看着满的、实际一个都不能收信。
-func countAliases(list []hme.Alias, mode string) int {
-	if mode == "all" {
-		return len(list)
-	}
+// countMatching 统计符合筛选条件的别名数量。
+func (p *Pool) countMatching(list []hme.Alias, f Filter) int {
 	n := 0
 	for _, a := range list {
-		if a.Active {
+		if p.matchAlias(a, f) {
 			n++
 		}
 	}
 	return n
+}
+
+// matchAlias 判断单个别名是否计入目标数量。
+func (p *Pool) matchAlias(a hme.Alias, f Filter) bool {
+	// 启用状态:iCloud 侧字段,直接看列表返回值。
+	if f.Active == FilterActiveOn && !a.Active {
+		return false
+	}
+	if f.GroupID == "" && f.State != FilterStateStock {
+		// 没有本地维度的条件,不必查元数据。
+		return true
+	}
+	meta, ok := p.be.AliasMeta(a.Email)
+	if !ok {
+		// 没有元数据 = 从未登记过:未分组 + 库存。
+		meta = Meta{State: StateStock}
+	}
+	if f.GroupID != "" && meta.GroupID != f.GroupID {
+		return false
+	}
+	// 元数据里的空状态表示"从没发出去过",按库存算(与列表页的判定一致)。
+	state := meta.State
+	if state == "" {
+		state = StateStock
+	}
+	if f.State == FilterStateStock && state != StateStock {
+		return false
+	}
+	return true
+}
+
+// nextCreateGap 返回两次建号之间的等待时长。
+//
+// 基准是 p.createGap(生产 3s),再乘一个 0.6–1.8 的随机倍数。补号是唯一
+// 会连续建号的路径,精确等间隔的节奏本身就是机器特征,这层抖动比任何
+// 请求头伪装都直接。基准为 0 时返回 0,便于测试跳过等待。
+func (p *Pool) nextCreateGap() time.Duration {
+	base := p.createGap
+	if base <= 0 {
+		return 0
+	}
+	return time.Duration(float64(base) * (0.6 + rand.Float64()*1.2))
 }
 
 func sleepCtx(ctx context.Context, d time.Duration) bool {
@@ -546,6 +794,25 @@ func (p *Pool) load() error {
 	defer p.mu.Unlock()
 	for id, c := range wrapper.Configs {
 		c.AccountID = id
+		// 旧配置只有 count_mode,没有 filter:载入时补齐默认值,
+		// 让老配置文件继续按原来的口径工作。
+		if c.CountMode != "" && c.Filter.Active == "" {
+			if c.CountMode == "all" {
+				c.Filter.Active = FilterActiveAll
+			} else {
+				c.Filter.Active = FilterActiveOn
+			}
+			c.CountMode = ""
+		}
+		if c.Filter.Active == "" {
+			c.Filter.Active = FilterActiveAll
+		}
+		if c.Filter.State == "" {
+			c.Filter.State = FilterStateAll
+		}
+		if c.Filter.GroupID != "" {
+			c.GroupID = c.Filter.GroupID
+		}
 		// 上次进程退出时可能正在检查,残留的 inflight 不该持久化(本来也没存)
 		p.configs[id] = &c
 	}

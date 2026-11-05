@@ -6,6 +6,8 @@ import (
 	"sync"
 
 	"github.com/gin-gonic/gin"
+
+	"icloud-hme/internal/aliasmeta"
 )
 
 // 别名批量操作接口。
@@ -66,9 +68,19 @@ func (s *Server) bulkAliasHandler(c *gin.Context) {
 	req.AccountID = strings.TrimSpace(req.AccountID)
 
 	switch req.Action {
-	case "deactivate", "reactivate", "delete", "assign_group":
+	case "deactivate", "reactivate", "delete", "assign_group", "issue_token", "revoke_token":
 	default:
 		failCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "参数错误: action 取值无效")
+		return
+	}
+
+	// 签发/撤销取件令牌同样不碰 iCloud:整批写一次本地文件。
+	if req.Action == "issue_token" {
+		s.bulkIssueTokens(c, req)
+		return
+	}
+	if req.Action == "revoke_token" {
+		s.bulkRevokeTokens(c, req)
 		return
 	}
 
@@ -144,6 +156,110 @@ func (s *Server) bulkAliasHandler(c *gin.Context) {
 		"applied":   succeeded,
 		"succeeded": succeeded,
 		"failed":    len(results) - succeeded,
+		"results":   results,
+	})
+}
+
+// bulkIssueTokens 为一批别名签发取件令牌。
+//
+// 与其它批量动作不同,这里失败概率极低(纯本地写文件),但仍逐条返回结果,
+// 并额外带上 "邮箱----链接" 分发串,前端可以直接导出成 txt 发出去。
+func (s *Server) bulkIssueTokens(c *gin.Context, req bulkAliasReq) {
+	base := s.publicBaseURL(c)
+	results := make([]bulkItemResult, 0, len(req.Aliases))
+	links := make(map[string]string, len(req.Aliases))
+	succeeded := 0
+
+	for _, item := range req.Aliases {
+		email := strings.ToLower(strings.TrimSpace(item.Email))
+		if email == "" || !strings.Contains(email, "@") {
+			results = append(results, bulkItemResult{
+				AnonymousID: item.AnonymousID,
+				Email:       item.Email,
+				OK:          false,
+				Error:       "缺少有效的 email",
+			})
+			continue
+		}
+		entry, err := s.meta.IssueToken(email, req.AccountID, "", false)
+		if err != nil {
+			results = append(results, bulkItemResult{
+				AnonymousID: item.AnonymousID,
+				Email:       item.Email,
+				OK:          false,
+				Error:       "签发失败: " + err.Error(),
+			})
+			continue
+		}
+		link := publicAliasURL(base, entry.Email, entry.Token)
+		links[entry.Email] = link
+		succeeded++
+		results = append(results, bulkItemResult{
+			AnonymousID: item.AnonymousID,
+			Email:       entry.Email,
+			OK:          true,
+		})
+	}
+
+	ok(c, gin.H{
+		"action":    req.Action,
+		"total":     len(results),
+		"applied":   succeeded,
+		"succeeded": succeeded,
+		"failed":    len(results) - succeeded,
+		"results":   results,
+		"links":     links,
+	})
+}
+
+// bulkRevokeTokens 批量撤销取件令牌。
+//
+// 没有令牌的别名直接跳过(不报错):批量撤销的常见场景是"这批链接全废掉",
+// 里面混着几个还没发出去的库存号是正常的。
+func (s *Server) bulkRevokeTokens(c *gin.Context, req bulkAliasReq) {
+	results := make([]bulkItemResult, 0, len(req.Aliases))
+	succeeded, revoked := 0, 0
+
+	for _, item := range req.Aliases {
+		email := strings.ToLower(strings.TrimSpace(item.Email))
+		if email == "" || !strings.Contains(email, "@") {
+			results = append(results, bulkItemResult{
+				AnonymousID: item.AnonymousID,
+				Email:       item.Email,
+				OK:          false,
+				Error:       "缺少有效的 email",
+			})
+			continue
+		}
+		entry, err := s.meta.RevokeToken(email)
+		if err != nil {
+			results = append(results, bulkItemResult{
+				AnonymousID: item.AnonymousID,
+				Email:       item.Email,
+				OK:          false,
+				Error:       "撤销失败: " + err.Error(),
+			})
+			continue
+		}
+		// 只有原本带令牌的才算真撤销了一次,库存号保持库存
+		if entry.State == aliasmeta.StateRevoked {
+			revoked++
+		}
+		succeeded++
+		results = append(results, bulkItemResult{
+			AnonymousID: item.AnonymousID,
+			Email:       email,
+			OK:          true,
+		})
+	}
+
+	ok(c, gin.H{
+		"action":    req.Action,
+		"total":     len(results),
+		"applied":   revoked,
+		"succeeded": succeeded,
+		"failed":    len(results) - succeeded,
+		"revoked":   revoked,
 		"results":   results,
 	})
 }

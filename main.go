@@ -17,6 +17,7 @@
 //	ICLOUD_HME_ADMIN_PASSWORD      管理员密码,至少 8 字符(进程启动后从环境清除)
 //	ICLOUD_HME_SESSION_TTL         会话有效期,默认 12h,范围 15m-168h
 //	ICLOUD_HME_SECURE_COOKIE       TLS 反向代理部署时设为 true
+//	ICLOUD_HME_PUBLIC_BASE_URL     分发出去的取件链接前缀,如 https://mail.example.com
 package main
 
 import (
@@ -25,6 +26,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"icloud-hme/internal/account"
@@ -35,7 +37,6 @@ func main() {
 	addr := flag.String("addr", ":8081", "HTTP 监听地址")
 	dataDir := flag.String("data", "./data", "数据目录 (accounts.json 存放位置)")
 	debug := flag.Bool("debug", false, "调试模式 (启用 Gin 调试日志)")
-	demo := flag.Bool("demo", false, "演示模式 (隐藏邮箱接口返回内存假数据, 不访问 iCloud)")
 	flag.Parse()
 
 	// 密码可用于首次初始化;一旦通过界面改过密码,将以数据目录中的
@@ -50,8 +51,6 @@ func main() {
 		log.Fatalf("ICLOUD_HME_SESSION_TTL 无效: %v", err)
 	}
 	secureCookie := os.Getenv("ICLOUD_HME_SECURE_COOKIE") == "true"
-	// 演示模式也可用环境变量打开,便于容器里不改进程参数
-	demoMode := *demo || os.Getenv("ICLOUD_HME_DEMO") == "true" || os.Getenv("ICLOUD_HME_DEMO") == "1"
 
 	log.Printf("iCloud Hide My Email 服务启动 addr=%s", *addr)
 
@@ -74,7 +73,7 @@ func main() {
 		SessionTTL:    sessionTTL,
 		SecureCookie:  secureCookie,
 		DataDir:       abs,
-		Demo:          demoMode,
+		PublicBaseURL: strings.TrimSpace(os.Getenv("ICLOUD_HME_PUBLIC_BASE_URL")),
 	})
 	if err != nil {
 		log.Fatalf("初始化服务失败: %v", err)

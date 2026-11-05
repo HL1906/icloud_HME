@@ -41,7 +41,9 @@ func NewStore(dataDir string) (*Store, error) {
 	if dataDir == "" {
 		dataDir = "."
 	}
-	if err := os.MkdirAll(dataDir, 0o755); err != nil {
+	// 数据目录里躺着账户凭据与取件令牌,统一收成 0700(仅属主可访问),
+	// 和 accounts.json / alias_meta.json 保持一致。
+	if err := os.MkdirAll(dataDir, 0o700); err != nil {
 		return nil, err
 	}
 	s := &Store{

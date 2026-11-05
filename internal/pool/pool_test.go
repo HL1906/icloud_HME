@@ -1,6 +1,7 @@
 package pool
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -12,19 +13,27 @@ import (
 
 // fakeBackend 是内存版上游,记录创建调用便于断言。
 type fakeBackend struct {
-	mu         sync.Mutex
-	ids        []string
-	aliases    map[string][]hme.Alias
-	created    []string          // 每次创建传入的 label(自动补号应恒为空)
-	assigned   map[string]string // email -> groupID
-	failCreate int               // 剩余允许失败的创建次数
-	alwaysFail bool
-	failList   bool
-	seq        int
+	mu            sync.Mutex
+	ids           []string
+	aliases       map[string][]hme.Alias
+	created       []string          // 每次创建传入的 label(自动补号应恒为空)
+	assigned      map[string]string // email -> groupID
+	metas         map[string]Meta   // 显式指定的本地元数据(优先于 assigned)
+	missingGroups map[string]bool   // 被视为"已删除"的分组
+	failCreate    int               // 剩余允许失败的创建次数
+	alwaysFail    bool
+	failList      bool
+	seq           int
 }
 
 func newFakeBackend(ids ...string) *fakeBackend {
-	return &fakeBackend{ids: ids, aliases: map[string][]hme.Alias{}, assigned: map[string]string{}}
+	return &fakeBackend{
+		ids:           ids,
+		aliases:       map[string][]hme.Alias{},
+		assigned:      map[string]string{},
+		metas:         map[string]Meta{},
+		missingGroups: map[string]bool{},
+	}
 }
 
 func (f *fakeBackend) AccountIDs() []string {
@@ -73,6 +82,25 @@ func (f *fakeBackend) AssignGroup(accountID, email, groupID string) error {
 	}
 	f.assigned[email] = groupID
 	return nil
+}
+
+// AliasMeta 用 assigned 当分组来源,状态默认库存;更细的场景由测试直接写 metas。
+func (f *fakeBackend) AliasMeta(email string) (Meta, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if m, ok := f.metas[email]; ok {
+		return m, true
+	}
+	if g, ok := f.assigned[email]; ok {
+		return Meta{GroupID: g, State: StateStock}, true
+	}
+	return Meta{}, false
+}
+
+func (f *fakeBackend) GroupExists(groupID string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return !f.missingGroups[groupID]
 }
 
 // seed 预置别名,active 控制启用状态。
@@ -323,14 +351,134 @@ func TestRemove(t *testing.T) {
 	}
 }
 
-// TestListAndCount 验证列表与统计口径。
-func TestListAndCount(t *testing.T) {
-	list := []hme.Alias{{Active: true}, {Active: true}, {Active: false}}
-	if n := countAliases(list, "active"); n != 2 {
-		t.Fatalf("active 口径应为 2,实际 %d", n)
+// TestCountMatchingByFilter 验证按筛选条件统计。
+func TestCountMatchingByFilter(t *testing.T) {
+	be := newFakeBackend("acc_1")
+	be.aliases["acc_1"] = []hme.Alias{
+		{Email: "a@icloud.com", Active: true},  // 分组 g1 + 库存
+		{Email: "b@icloud.com", Active: true},  // 分组 g1 + 已分发
+		{Email: "c@icloud.com", Active: true},  // 未登记
+		{Email: "d@icloud.com", Active: false}, // 分组 g2 + 库存
 	}
-	if n := countAliases(list, "all"); n != 3 {
-		t.Fatalf("all 口径应为 3,实际 %d", n)
+	be.metas["a@icloud.com"] = Meta{GroupID: "g1", State: StateStock}
+	be.metas["b@icloud.com"] = Meta{GroupID: "g1", State: "issued"}
+	// 空状态表示"从没发出去过",应当按库存算
+	be.metas["d@icloud.com"] = Meta{GroupID: "g2", State: ""}
+
+	p := newTestPool(t, be)
+	cases := []struct {
+		name string
+		f    Filter
+		want int
+	}{
+		{"不限条件算全部", Filter{}, 4},
+		{"只算启用中", Filter{Active: FilterActiveOn}, 3},
+		{"只算库存(空状态视为库存)", Filter{State: FilterStateStock}, 3},
+		{"限定分组", Filter{GroupID: "g1"}, 2},
+		{"限定分组 + 库存", Filter{GroupID: "g1", State: FilterStateStock}, 1},
+		{"分组 + 启用中", Filter{GroupID: "g2", Active: FilterActiveOn}, 0},
+		{"不存在的分组", Filter{GroupID: "g9"}, 0},
+	}
+	for _, tc := range cases {
+		if got := p.countMatching(be.aliases["acc_1"], tc.f); got != tc.want {
+			t.Fatalf("%s: 期望 %d,实际 %d", tc.name, tc.want, got)
+		}
+	}
+}
+
+// TestCheckOnceCountsOnlyMatching 验证目标数量针对的是筛选后的结果。
+func TestCheckOnceCountsOnlyMatching(t *testing.T) {
+	be := newFakeBackend("acc_1")
+	// 账号下已有 4 个别名,其中只有 1 个属于 g1 且是库存
+	be.aliases["acc_1"] = []hme.Alias{
+		{Email: "a@icloud.com", Active: true},
+		{Email: "b@icloud.com", Active: true},
+		{Email: "c@icloud.com", Active: true},
+		{Email: "d@icloud.com", Active: true},
+	}
+	be.metas["a@icloud.com"] = Meta{GroupID: "g1", State: StateStock}
+	be.metas["b@icloud.com"] = Meta{GroupID: "g1", State: "issued"}
+	be.metas["c@icloud.com"] = Meta{GroupID: "g2", State: StateStock}
+
+	p := newTestPool(t, be)
+	cfg, err := p.Upsert(Config{
+		AccountID: "acc_1",
+		Target:    3,
+		Filter:    Filter{GroupID: "g1", State: FilterStateStock},
+	})
+	if err != nil {
+		t.Fatalf("Upsert: %v", err)
+	}
+	if cfg.GroupID != "g1" {
+		t.Fatalf("按分组统计时新邮箱应归入同一分组,实际 %q", cfg.GroupID)
+	}
+	res, err := p.CheckOnce("acc_1")
+	if err != nil {
+		t.Fatalf("CheckOnce: %v", err)
+	}
+	// 符合条件 1 个,目标 3 → 补 2 个(而不是按 4 个总数算出 0)
+	if res.Current != 1 || res.Created != 2 {
+		t.Fatalf("期望 current=1 created=2,实际 current=%d created=%d", res.Current, res.Created)
+	}
+	for _, email := range res.Emails {
+		if be.assigned[email] != "g1" {
+			t.Fatalf("新邮箱 %s 应归入 g1,实际 %q", email, be.assigned[email])
+		}
+	}
+}
+
+// TestCheckOnceStopsWhenFilterGroupMissing 验证筛选分组被删除后停止补号。
+func TestCheckOnceStopsWhenFilterGroupMissing(t *testing.T) {
+	be := newFakeBackend("acc_1")
+	be.missingGroups["g1"] = true
+	p := newTestPool(t, be)
+	if _, err := p.Upsert(Config{AccountID: "acc_1", Target: 5, Filter: Filter{GroupID: "g1"}}); err != nil {
+		t.Fatalf("Upsert: %v", err)
+	}
+	res, err := p.CheckOnce("acc_1")
+	if err != nil {
+		t.Fatalf("CheckOnce: %v", err)
+	}
+	if res.Created != 0 {
+		t.Fatalf("分组不存在时不该创建,实际 %d", res.Created)
+	}
+	if res.Error == "" {
+		t.Fatal("应回显错误原因")
+	}
+}
+
+// TestUpsertMigratesCountMode 验证旧字段 count_mode 并入 filter.active。
+func TestUpsertMigratesCountMode(t *testing.T) {
+	be := newFakeBackend("acc_1")
+	p := newTestPool(t, be)
+	cfg, err := p.Upsert(Config{AccountID: "acc_1", Target: 3, CountMode: "all"})
+	if err != nil {
+		t.Fatalf("Upsert: %v", err)
+	}
+	if cfg.Filter.Active != FilterActiveAll {
+		t.Fatalf("count_mode=all 应迁移为 active=all,实际 %q", cfg.Filter.Active)
+	}
+	if cfg.CountMode != "" {
+		t.Fatalf("迁移后不该再写出 count_mode,实际 %q", cfg.CountMode)
+	}
+}
+
+// TestUpsertRejectsUnsafeFilter 验证会导致无限补号的条件被拒绝。
+func TestUpsertRejectsUnsafeFilter(t *testing.T) {
+	be := newFakeBackend("acc_1")
+	p := newTestPool(t, be)
+	cases := []struct {
+		name string
+		f    Filter
+	}{
+		{"按已分发统计", Filter{State: "issued"}},
+		{"按已回收统计", Filter{State: "revoked"}},
+		{"按已停用统计", Filter{Active: "inactive"}},
+	}
+	for _, tc := range cases {
+		if _, err := p.Upsert(Config{AccountID: "acc_1", Target: 3, Filter: tc.f}); err == nil {
+			t.Fatalf("%s 应被拒绝", tc.name)
+		}
 	}
 }
 
@@ -451,4 +599,132 @@ func TestUpsertRaiseTargetRechecksImmediately(t *testing.T) {
 	if re, _ := p.Get("acc_1"); re.LastCheckAt != "" {
 		t.Fatalf("重新启用后应立即重试,实际 LastCheckAt=%q", re.LastCheckAt)
 	}
+}
+
+// TestPreviewCountsWithoutCreating 验证试算只统计、不创建,并给出状态分布。
+func TestPreviewCountsWithoutCreating(t *testing.T) {
+	be := newFakeBackend("acc_1")
+	be.aliases["acc_1"] = []hme.Alias{
+		{Email: "a@icloud.com", Active: true},  // 库存
+		{Email: "b@icloud.com", Active: true},  // 已分发
+		{Email: "c@icloud.com", Active: false}, // 已回收 + 停用
+	}
+	be.metas["a@icloud.com"] = Meta{State: StateStock}
+	be.metas["b@icloud.com"] = Meta{State: "issued"}
+	be.metas["c@icloud.com"] = Meta{State: "revoked"}
+
+	p := newTestPool(t, be)
+	// 没配置过也能试算:按「可用库存」口径,默认目标 20
+	got, err := p.Preview("acc_1", nil, 0)
+	if err != nil {
+		t.Fatalf("Preview: %v", err)
+	}
+	if got.Target != DefaultTarget {
+		t.Fatalf("未配置时目标应为默认 %d,实际 %d", DefaultTarget, got.Target)
+	}
+	if got.Current != 1 {
+		t.Fatalf("可用库存应为 1(只有 a 是库存且启用),实际 %d", got.Current)
+	}
+	// 单轮上限默认 3,差 19 个也只报 3
+	if got.ToCreate != DefaultMaxPerRun {
+		t.Fatalf("本轮预计补 %d 个,实际 %d", DefaultMaxPerRun, got.ToCreate)
+	}
+	if got.Breakdown.Stock != 1 || got.Breakdown.Issued != 1 || got.Breakdown.Revoked != 1 {
+		t.Fatalf("状态分布不对: %+v", got.Breakdown)
+	}
+	if got.Breakdown.Inactive != 1 || got.Breakdown.Total != 3 {
+		t.Fatalf("停用/总数不对: %+v", got.Breakdown)
+	}
+	if len(be.aliases["acc_1"]) != 3 {
+		t.Fatalf("试算不该创建别名,实际 %d 个", len(be.aliases["acc_1"]))
+	}
+
+	// 目标已达成的口径:全部别名,目标 3 → 不补
+	all := Filter{State: FilterStateAll, Active: FilterActiveAll}
+	got, err = p.Preview("acc_1", &all, 3)
+	if err != nil {
+		t.Fatalf("Preview: %v", err)
+	}
+	if got.Current != 3 || got.ToCreate != 0 {
+		t.Fatalf("全部别名口径应为 3 个且不补,实际 current=%d to_create=%d", got.Current, got.ToCreate)
+	}
+}
+
+// TestPreviewRejectsUnsafeFilter 验证试算同样会拦下不安全的筛选条件。
+func TestPreviewRejectsUnsafeFilter(t *testing.T) {
+	be := newFakeBackend("acc_1")
+	be.aliases["acc_1"] = []hme.Alias{{Email: "a@icloud.com", Active: true}}
+	p := newTestPool(t, be)
+
+	bad := Filter{State: "issued"}
+	got, err := p.Preview("acc_1", &bad, 10)
+	if err != nil {
+		t.Fatalf("Preview: %v", err)
+	}
+	if got.Error == "" {
+		t.Fatal("按已分发试算应返回错误说明")
+	}
+}
+
+// TestConcurrentCheckOnceCreatesOnce 并发调用 CheckOnce 时只能有一个真正执行。
+//
+// 这是"重复建号"的最后一道闸:两个请求同时进来,如果都通过了在途判断,
+// 就会各自按差额建一遍,凭空多出一倍的号。
+func TestConcurrentCheckOnceCreatesOnce(t *testing.T) {
+	be := newFakeBackend("acc_1")
+	be.seed("acc_1", 0, 0)
+	p := newTestPool(t, be)
+	// 放慢单次创建,给并发竞争留出窗口
+	p.createGap = 60 * time.Millisecond
+	if _, err := p.Upsert(Config{AccountID: "acc_1", Target: 4, MaxPerRun: 4}); err != nil {
+		t.Fatalf("Upsert: %v", err)
+	}
+
+	const workers = 8
+	var wg sync.WaitGroup
+	busy := make(chan struct{}, workers)
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := p.CheckOnce("acc_1"); errors.Is(err, ErrBusy) {
+				busy <- struct{}{}
+			}
+		}()
+	}
+	wg.Wait()
+	close(busy)
+
+	// 目标 4 个,不管几个并发,最终数量必须正好是 4
+	got := len(be.aliases["acc_1"])
+	if got != 4 {
+		t.Fatalf("并发检查后应有且只有 4 个,实际 %d", got)
+	}
+	// 其余请求应当被明确拒绝(而不是排队重复执行)
+	if len(busy) == 0 {
+		t.Log("本轮没有并发冲突(调度太快),数量正确即可")
+	}
+}
+
+// TestPreviewConcurrentWithCheck 试算与真实检查同时进行时不创建、不阻塞。
+func TestPreviewConcurrentWithCheck(t *testing.T) {
+	be := newFakeBackend("acc_1")
+	be.seed("acc_1", 1, 0)
+	p := newTestPool(t, be)
+	if _, err := p.Upsert(Config{AccountID: "acc_1", Target: 5, MaxPerRun: 2}); err != nil {
+		t.Fatalf("Upsert: %v", err)
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { defer wg.Done(); _, _ = p.CheckOnce("acc_1") }()
+	go func() {
+		defer wg.Done()
+		pv, err := p.Preview("acc_1", nil, 0)
+		if err != nil {
+			t.Errorf("Preview: %v", err)
+		}
+		_ = pv
+	}()
+	wg.Wait()
 }

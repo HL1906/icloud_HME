@@ -6,11 +6,14 @@ import type {
   Alias,
   AliasListResult,
   AliasMeta,
+  AliasState,
+  AliasTokenResult,
   BulkAliasAction,
   BulkAliasResult,
   BulkAliasTarget,
   Group,
   ScanActivityResult,
+  Tag,
 } from '../api/types'
 import AliasEditDialog from '../components/AliasEditDialog'
 import AsyncState from '../components/AsyncState'
@@ -18,17 +21,20 @@ import CreateAliasDialog from '../components/CreateAliasDialog'
 import ConfirmDialog from '../components/ConfirmDialog'
 import PageHeader from '../components/PageHeader'
 import Pagination from '../components/Pagination'
+import TagChip from '../components/TagChip'
 import { useToast } from '../components/ToastProvider'
 import { copyText } from '../utils/clipboard'
-import { downloadCSV, timestampedName } from '../utils/csv'
+import { downloadCSV, downloadText, timestampedName } from '../utils/csv'
 import {
   IconCheck,
   IconChevronDown,
   IconChevronUp,
   IconClock,
+  IconCopy,
   IconDownload,
   IconEdit,
   IconInbox,
+  IconKey,
   IconPlus,
   IconRefresh,
   IconSearch,
@@ -40,14 +46,17 @@ type SortDirection = 'asc' | 'desc'
 /** 未分组的筛选值（分组 id 都以 g_ 开头，不会冲突） */
 const NO_GROUP = '__none__'
 const ALL_GROUPS = 'all'
+/** 标注筛选：全部 / 未标注 */
+const NO_TAG = '__notag__'
+const ALL_TAGS = 'all'
 
 /** 收信状况筛选。stale30/stale90 表示"超过 N 天没有收到邮件"。 */
 type ActivityFilter = 'all' | 'never' | 'stale30' | 'stale90'
 
 const DAY_MS = 24 * 60 * 60 * 1000
 
-/** 需要二次确认的批量操作；归组是本地改动，直接执行 */
-type BulkConfirmAction = 'deactivate' | 'reactivate' | 'delete'
+/** 需要二次确认的单条/批量操作；归组与签发取件链接是本地改动，直接执行 */
+type BulkConfirmAction = 'deactivate' | 'reactivate' | 'delete' | 'revoke'
 
 /** 批量操作的中文名，按钮和提示共用一套措辞 */
 const BULK_LABEL: Record<BulkAliasAction, string> = {
@@ -55,6 +64,48 @@ const BULK_LABEL: Record<BulkAliasAction, string> = {
   reactivate: '激活',
   delete: '删除',
   assign_group: '归入分组',
+  issue_token: '生成取件链接',
+  revoke_token: '撤销取件链接',
+}
+
+/** 分发状态的中文名与徽章样式。没有登记过的别名按「库存」展示。 */
+const STATE_LABEL: Record<AliasState, string> = {
+  stock: '库存',
+  issued: '已分发',
+  revoked: '已回收',
+}
+
+const STATE_BADGE: Record<AliasState, string> = {
+  stock: 'badge badge-neutral',
+  issued: 'badge badge-info',
+  revoked: 'badge badge-error',
+}
+
+/** 没有登记过分发状态的别名一律按「库存」处理 */
+function aliasStateOf(entry: AliasMeta | undefined): AliasState {
+  return entry?.state ?? 'stock'
+}
+
+/**
+ * 算出「这条取件链接什么时候会被自动回收」。
+ *
+ * 没有待回收的链接时返回 null：未分组、分组设为不回收、或者链接已经回收过了
+ * （已回收的 issued_at 还留着，但不会再被扫一次，显示一个过去的时间只会误导）。
+ * 剩 2 天以内标黄，已经过了回收时间标红。
+ */
+function describeExpiry(
+  entry: AliasMeta | undefined,
+  group: Group | undefined,
+): { due: Date; className: string } | null {
+  if (!entry?.token) return null
+  const issued = dateTimestamp(entry.issued_at)
+  const days = group?.revoke_after_days ?? 0
+  if (issued === null || days <= 0) return null
+  const dueAt = issued + days * DAY_MS
+  const left = dueAt - Date.now()
+  if (left <= 0) return { due: new Date(dueAt), className: 'cell-secondary cell-expired' }
+  const className = left <= 2 * DAY_MS ? 'cell-secondary cell-stale' : 'cell-secondary'
+  return { due: new Date(dueAt), className }
 }
 
 function parseAliasDate(raw?: string): Date | null {
@@ -83,29 +134,19 @@ function parseAliasDate(raw?: string): Date | null {
   return Number.isNaN(date.getTime()) ? null : date
 }
 
-function formatDate(raw?: string): string {
-  const date = parseAliasDate(raw)
-  if (!date) return raw?.trim() || '—'
+function formatDateValue(date: Date): string {
   const pad = (value: number) => String(value).padStart(2, '0')
   return `${date.getFullYear()}/${pad(date.getMonth() + 1)}/${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`
 }
 
-function dateTimestamp(raw?: string): number | null {
-  return parseAliasDate(raw)?.getTime() ?? null
+function formatDate(raw?: string): string {
+  const date = parseAliasDate(raw)
+  if (!date) return raw?.trim() || '—'
+  return formatDateValue(date)
 }
 
-/** 把时间戳说成"3 天前 / 2 个月前"，一眼能判断这个号还活着没。 */
-function formatRelative(raw?: string): string {
-  const timestamp = dateTimestamp(raw)
-  if (timestamp === null) return ''
-  const diff = Date.now() - timestamp
-  if (diff < 0) return '刚刚'
-  const days = Math.floor(diff / DAY_MS)
-  if (days === 0) return '今天'
-  if (days === 1) return '昨天'
-  if (days < 30) return `${days} 天前`
-  if (days < 365) return `${Math.floor(days / 30)} 个月前`
-  return `${Math.floor(days / 365)} 年前`
+function dateTimestamp(raw?: string): number | null {
+  return parseAliasDate(raw)?.getTime() ?? null
 }
 
 /**
@@ -135,11 +176,15 @@ export default function AliasesPage() {
   const [aliases, setAliases] = useState<Alias[]>([])
   const [meta, setMeta] = useState<Record<string, AliasMeta>>({})
   const [groups, setGroups] = useState<Group[]>([])
+  // 标注目录:用于列表展示与编辑时分配
+  const [tags, setTags] = useState<Tag[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
   const [retryKey, setRetryKey] = useState(0)
   const [search, setSearch] = useState('')
   const [filter, setFilter] = useState<'all' | 'active' | 'inactive'>('all')
+  // 分发状态筛选：库存（还没发出去）/ 已分发 / 已回收
+  const [stateFilter, setStateFilter] = useState<AliasState | 'all'>('all')
   const [sortDirection, setSortDirection] = useState<SortDirection>('desc')
   // 客户端分页:别名通常在几十到几百条,一次拉全量再本地分页体验最好
   const [page, setPage] = useState(1)
@@ -163,6 +208,7 @@ export default function AliasesPage() {
 
   const [searchParams, setSearchParams] = useSearchParams()
   const groupFilter = searchParams.get('group_id') ?? ALL_GROUPS
+  const tagFilter = searchParams.get('tag_id') ?? ALL_TAGS
   const { show, showCopyable } = useToast()
 
   function setGroupFilter(value: string) {
@@ -171,6 +217,17 @@ export default function AliasesPage() {
       next.delete('group_id')
     } else {
       next.set('group_id', value)
+    }
+    setSearchParams(next, { replace: true })
+    setPage(1)
+  }
+
+  function setTagFilter(value: string) {
+    const next = new URLSearchParams(searchParams)
+    if (value === ALL_TAGS) {
+      next.delete('tag_id')
+    } else {
+      next.set('tag_id', value)
     }
     setSearchParams(next, { replace: true })
     setPage(1)
@@ -222,6 +279,21 @@ export default function AliasesPage() {
     }
   }, [retryKey])
 
+  // 加载标注目录(用于列表展示、筛选与编辑)
+  useEffect(() => {
+    let cancelled = false
+    request<{ tags: Tag[] }>('/api/tags')
+      .then((data) => {
+        if (!cancelled) setTags(data.tags ?? [])
+      })
+      .catch(() => {
+        // 标注拉不到不影响邮箱列表,列里按"未标注"降级
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [retryKey])
+
   // 加载别名列表(响应里带本地分组/备注)
   useEffect(() => {
     if (!accountId) return
@@ -251,6 +323,21 @@ export default function AliasesPage() {
     return map
   }, [groups])
 
+  const tagById = useMemo(() => {
+    const map = new Map<string, Tag>()
+    for (const tag of tags) map.set(tag.id, tag)
+    return map
+  }, [tags])
+
+  /** 取某个邮箱挂着的标注对象(顺序按目录顺序,保证界面稳定)。 */
+  const tagsOf = useCallback(
+    (entry: AliasMeta | undefined): Tag[] => {
+      if (!entry?.tag_ids?.length) return []
+      return entry.tag_ids.map((id) => tagById.get(id)).filter((t): t is Tag => Boolean(t))
+    },
+    [tagById],
+  )
+
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase()
     return aliases
@@ -263,14 +350,24 @@ export default function AliasesPage() {
         if (groupFilter !== ALL_GROUPS && groupFilter !== NO_GROUP && entry?.group_id !== groupFilter) {
           return false
         }
+        if (tagFilter === NO_TAG && (entry?.tag_ids?.length ?? 0) > 0) return false
+        if (tagFilter !== ALL_TAGS && tagFilter !== NO_TAG && !(entry?.tag_ids ?? []).includes(tagFilter)) {
+          return false
+        }
         if (activityFilter === 'never' && dateTimestamp(entry?.last_received_at) !== null) return false
         if (activityFilter === 'stale30' && !isStale(alias, entry, 30)) return false
         if (activityFilter === 'stale90' && !isStale(alias, entry, 90)) return false
+        if (stateFilter !== 'all' && aliasStateOf(entry) !== stateFilter) return false
         if (!q) return true
+        // 搜索同时覆盖邮箱、iCloud 标签、本地备注和标注名
+        const tagHit = (entry?.tag_ids ?? []).some((id) =>
+          (tagById.get(id)?.name ?? '').toLowerCase().includes(q),
+        )
         return (
           alias.email.toLowerCase().includes(q) ||
           alias.label.toLowerCase().includes(q) ||
-          (entry?.note ?? '').toLowerCase().includes(q)
+          (entry?.note ?? '').toLowerCase().includes(q) ||
+          tagHit
         )
       })
       .sort((left, right) => {
@@ -286,7 +383,7 @@ export default function AliasesPage() {
         return sortDirection === 'asc' ? leftTime - rightTime : rightTime - leftTime
       })
       .map(({ alias }) => alias)
-  }, [aliases, meta, search, filter, groupFilter, activityFilter, sortDirection])
+  }, [aliases, meta, search, filter, groupFilter, tagFilter, tagById, activityFilter, stateFilter, sortDirection])
 
   // 当前页的数据切片(过滤+排序之后)
   const safePage = Math.min(page, Math.max(1, Math.ceil(filtered.length / pageSize)))
@@ -347,6 +444,13 @@ export default function AliasesPage() {
         }),
       })
       const label = BULK_LABEL[action]
+      // 批量签发顺带把分发清单下载下来，省得再点一次「分发清单」
+      if (action === 'issue_token') {
+        const lines = Object.entries(result.links ?? {})
+          .map(([email, url]) => `${email}----${url}`)
+          .join('\n')
+        if (lines) downloadText(timestampedName('icloud-分发清单', 'txt'), lines)
+      }
       if (result.failed === 0) {
         show(`已${label} ${result.succeeded} 个邮箱`)
         setSelected(new Set())
@@ -406,16 +510,22 @@ export default function AliasesPage() {
     }
     const accountName = accounts.find((a) => a.id === accountId)?.name ?? accountId
     const rows = [
-      ['邮箱', '标签', '分组', '备注', '状态', '最近收信', '创建时间', '账号'],
+      ['邮箱', '标签', '分组', '标注', '备注', '状态', '分发时间', '自动回收时间', '最近收信', '创建时间', '账号'],
       ...filtered.map((alias) => {
         const entry = meta[alias.email.toLowerCase()]
         const group = entry?.group_id ? groupById.get(entry.group_id) : undefined
+        const expiry = describeExpiry(entry, group)
         return [
           alias.email,
           alias.label,
           group?.name ?? '未分组',
+          tagsOf(entry)
+            .map((t) => t.name)
+            .join('/'),
           entry?.note ?? '',
           alias.active ? '已启用' : '已停用',
+          entry?.issued_at ? formatDate(entry.issued_at) : '',
+          expiry ? formatDateValue(expiry.due) : '',
           entry?.last_received_at ? formatDate(entry.last_received_at) : '',
           formatDate(alias.createdAt),
           accountName,
@@ -442,6 +552,80 @@ export default function AliasesPage() {
     [show, showCopyable],
   )
 
+  /**
+   * 签发（或取回）某个别名的取件链接。
+   *
+   * 接口是幂等的：已经有令牌就返回原来那条，所以「复制」和「生成」可以共用一个入口，
+   * 不会因为手滑点两下就把已经发出去的链接弄失效。
+   */
+  async function issueToken(email: string, rotate = false): Promise<AliasTokenResult | null> {
+    setActionError('')
+    try {
+      const result = await request<AliasTokenResult>('/api/alias-token', {
+        method: 'POST',
+        body: JSON.stringify({ account_id: accountId, email, rotate }),
+      })
+      setRetryKey((k) => k + 1)
+      return result
+    } catch (err) {
+      setActionError(err instanceof ApiError ? err.message : '生成取件链接失败，请稍后重试')
+      return null
+    }
+  }
+
+  /** 复制分发串：邮箱----取件链接，对方拿到就能自己查收邮件。 */
+  async function copyApiLink(email: string) {
+    const result = await issueToken(email)
+    if (!result) return
+    if (await copyText(result.distribute)) {
+      show('已复制：邮箱----取件链接')
+    } else {
+      showCopyable(result.distribute, '复制失败，请手动复制')
+    }
+  }
+
+  /**
+   * 导出分发清单：每行一条 "邮箱----取件链接"。
+   *
+   * 走批量签发接口，所以库存里的邮箱会顺带拿到令牌；
+   * 已经分发过的复用原链接，不会影响已经发出去的。
+   */
+  async function exportDistributeList() {
+    if (filtered.length === 0) {
+      show('当前没有可分发的邮箱')
+      return
+    }
+    setBusy(true)
+    setActionError('')
+    try {
+      const result = await request<BulkAliasResult>('/api/alias-bulk', {
+        method: 'POST',
+        body: JSON.stringify({
+          account_id: accountId,
+          action: 'issue_token',
+          aliases: filtered.map((alias) => ({
+            anonymous_id: alias.anonymousId,
+            email: alias.email,
+          })),
+        }),
+      })
+      const lines = Object.entries(result.links ?? {})
+        .map(([email, url]) => `${email}----${url}`)
+        .join('\n')
+      if (!lines) {
+        show('没有拿到可用的取件链接')
+        return
+      }
+      downloadText(timestampedName('icloud-分发清单', 'txt'), lines)
+      show(`已导出 ${Object.keys(result.links ?? {}).length} 条分发记录`)
+      setRetryKey((k) => k + 1)
+    } catch (err) {
+      setActionError(err instanceof ApiError ? err.message : '导出失败，请稍后重试')
+    } finally {
+      setBusy(false)
+    }
+  }
+
   async function runAction(type: BulkConfirmAction) {
     if (!confirm || 'bulk' in confirm) return
     setBusy(true)
@@ -457,6 +641,12 @@ export default function AliasesPage() {
           },
         )
         show('别名已删除')
+      } else if (type === 'revoke') {
+        // 撤销只清掉本地令牌：别名本身还在，iCloud 那边不受影响
+        await request(`/api/alias-token?email=${encodeURIComponent(alias.email)}`, {
+          method: 'DELETE',
+        })
+        show('取件链接已撤销')
       } else {
         await request(
           `/api/aliases/${encodeURIComponent(alias.anonymousId)}/${type === 'deactivate' ? 'deactivate' : 'reactivate'}`,
@@ -488,12 +678,24 @@ export default function AliasesPage() {
   const isBulkConfirm = confirm !== null && 'bulk' in confirm
   const confirmTitle = confirm
     ? `${isBulkConfirm ? '批量' : ''}${
-        confirm.type === 'delete' ? '删除邮箱' : confirm.type === 'deactivate' ? '停用邮箱' : '激活邮箱'
+        confirm.type === 'delete'
+          ? '删除邮箱'
+          : confirm.type === 'deactivate'
+            ? '停用邮箱'
+            : confirm.type === 'revoke'
+              ? '撤销取件链接'
+              : '激活邮箱'
       }`
     : ''
 
   const confirmLabel =
-    confirm?.type === 'delete' ? '确认删除' : confirm?.type === 'deactivate' ? '确认停用' : '确认激活'
+    confirm?.type === 'delete'
+      ? '确认删除'
+      : confirm?.type === 'deactivate'
+        ? '确认停用'
+        : confirm?.type === 'revoke'
+          ? '确认撤销'
+          : '确认激活'
 
   // 单条删除沿用"输入完整邮箱"的防误删流程；批量删除没法逐条核对，只做一次普通确认。
   const confirmRequireText =
@@ -509,6 +711,9 @@ export default function AliasesPage() {
       if (confirm.type === 'deactivate') {
         return `将停用选中的 ${n} 个邮箱，之后它们将不再接收邮件。`
       }
+      if (confirm.type === 'revoke') {
+        return `将撤销选中的 ${n} 个邮箱的取件链接。已经发出去的链接会立刻失效，但邮箱本身不受影响，随时可以重新生成。`
+      }
       return `将重新激活选中的 ${n} 个邮箱。`
     }
     const email = confirm.alias.email
@@ -517,6 +722,9 @@ export default function AliasesPage() {
     }
     if (confirm.type === 'deactivate') {
       return `将停用邮箱 ${email}，之后该邮箱将不再接收邮件。`
+    }
+    if (confirm.type === 'revoke') {
+      return `将撤销 ${email} 的取件链接。已经拿到链接的人会立刻打不开，但邮箱本身不受影响，之后可以重新生成。`
     }
     return `将重新激活邮箱 ${email}。`
   })()
@@ -538,6 +746,14 @@ export default function AliasesPage() {
             <button onClick={exportCSV} disabled={filtered.length === 0} title="导出当前筛选结果">
               <IconDownload size={16} />
               导出 CSV
+            </button>
+            <button
+              onClick={() => void exportDistributeList()}
+              disabled={!accountId || busy || filtered.length === 0}
+              title="为当前筛选结果生成「邮箱----取件链接」清单（库存邮箱会顺带签发令牌）"
+            >
+              <IconKey size={16} />
+              分发清单
             </button>
             <label className="inline-label" htmlFor="alias-account">
               账号
@@ -606,6 +822,23 @@ export default function AliasesPage() {
             </select>
           </div>
           <div className="toolbar-field">
+            <label htmlFor="alias-tag-filter">标注</label>
+            <select
+              id="alias-tag-filter"
+              value={tagFilter}
+              onChange={(e) => setTagFilter(e.target.value)}
+              style={{ width: 'auto' }}
+            >
+              <option value={ALL_TAGS}>全部标注</option>
+              <option value={NO_TAG}>未标注</option>
+              {tags.map((t) => (
+                <option key={t.id} value={t.id}>
+                  {t.name}
+                </option>
+              ))}
+            </select>
+          </div>
+          <div className="toolbar-field">
             <label htmlFor="alias-filter">状态</label>
             <select
               id="alias-filter"
@@ -619,6 +852,23 @@ export default function AliasesPage() {
               <option value="all">全部</option>
               <option value="active">已启用</option>
               <option value="inactive">已停用</option>
+            </select>
+          </div>
+          <div className="toolbar-field">
+            <label htmlFor="alias-state-filter">分发</label>
+            <select
+              id="alias-state-filter"
+              value={stateFilter}
+              onChange={(e) => {
+                setStateFilter(e.target.value as AliasState | 'all')
+                setPage(1)
+              }}
+              style={{ width: 'auto' }}
+            >
+              <option value="all">全部</option>
+              <option value="stock">库存</option>
+              <option value="issued">已分发</option>
+              <option value="revoked">已回收</option>
             </select>
           </div>
           <div className="toolbar-field">
@@ -669,6 +919,21 @@ export default function AliasesPage() {
                   </option>
                 ))}
               </select>
+              <button
+                disabled={busy}
+                onClick={() => void runBulk('issue_token')}
+                title="为选中的邮箱签发取件链接（已签发过的复用原链接）"
+              >
+                <IconKey size={14} />
+                取件链接
+              </button>
+              <button
+                disabled={busy}
+                onClick={() => setConfirm({ type: 'revoke', bulk: true })}
+                title="撤销选中邮箱的取件链接，已经发出去的链接会立刻失效"
+              >
+                撤销链接
+              </button>
               <button disabled={busy} onClick={() => setConfirm({ type: 'deactivate', bulk: true })}>
                 停用
               </button>
@@ -713,7 +978,10 @@ export default function AliasesPage() {
                   <th>邮箱</th>
                   <th>标签</th>
                   <th>分组</th>
+                  <th>标注</th>
                   <th>状态</th>
+                  <th>分发</th>
+                  <th>自动回收时间</th>
                   <th>最近收信</th>
                   <th aria-sort={sortDirection === 'asc' ? 'ascending' : 'descending'}>
                     <button
@@ -735,6 +1003,8 @@ export default function AliasesPage() {
                   const entry = meta[alias.email.toLowerCase()]
                   const group = entry?.group_id ? groupById.get(entry.group_id) : undefined
                   const checked = selected.has(alias.anonymousId)
+                  const state = aliasStateOf(entry)
+                  const expiry = describeExpiry(entry, group)
                   return (
                     <tr key={alias.anonymousId} className={checked ? 'row-selected' : undefined}>
                       <td className="col-check">
@@ -768,18 +1038,77 @@ export default function AliasesPage() {
                         )}
                       </td>
                       <td>
+                        {(() => {
+                          const entryTags = tagsOf(entry)
+                          if (entryTags.length === 0) return <span className="cell-muted">—</span>
+                          return (
+                            <span className="tag-cell">
+                              {entryTags.map((tag) => (
+                                <TagChip
+                                  key={tag.id}
+                                  tag={tag}
+                                  small
+                                  onClick={() => setTagFilter(tag.id)}
+                                />
+                              ))}
+                            </span>
+                          )
+                        })()}
+                      </td>
+                      <td>
                         <span className={alias.active ? 'badge badge-active' : 'badge badge-neutral'}>
                           {alias.active ? <IconCheck size={12} /> : <IconClock size={12} />}
                           {alias.active ? '已启用' : '已停用'}
                         </span>
                       </td>
                       <td>
+                        <span
+                          className={STATE_BADGE[state]}
+                          title={
+                            entry?.issued_at
+                              ? `${state === 'revoked' ? '上次分发时间' : '分发时间'}：${formatDate(entry.issued_at)}`
+                              : undefined
+                          }
+                        >
+                          {state === 'issued' ? (
+                            <IconKey size={12} />
+                          ) : state === 'revoked' ? (
+                            <IconClock size={12} />
+                          ) : (
+                            <IconCheck size={12} />
+                          )}
+                          {STATE_LABEL[state]}
+                        </span>
+                      </td>
+                      <td>
+                        {expiry ? (
+                          <span
+                            className={expiry.className}
+                            title={
+                              group?.revoke_after_days
+                                ? `分组「${group.name}」设为签发 ${group.revoke_after_days} 天后自动回收`
+                                : undefined
+                            }
+                          >
+                            {formatDateValue(expiry.due)}
+                          </span>
+                        ) : (
+                          <span
+                            className="cell-muted"
+                            title="未设置自动回收：该邮箱未分组，或所属分组设为不回收"
+                          >
+                            —
+                          </span>
+                        )}
+                      </td>
+                      <td>
                         {entry?.last_received_at ? (
                           <span
-                            className={isStale(alias, entry, 90) ? 'cell-stale' : undefined}
-                            title={formatDate(entry.last_received_at)}
+                            className={
+                              isStale(alias, entry, 90) ? 'cell-secondary cell-stale' : 'cell-secondary'
+                            }
                           >
-                            {formatRelative(entry.last_received_at)}
+                            {formatDate(entry.last_received_at)}
                           </span>
                         ) : (
                           <span className="cell-muted" title="尚未扫描到投递到该邮箱的邮件">
@@ -789,11 +1118,40 @@ export default function AliasesPage() {
                       </td>
                       <td>{formatDate(alias.createdAt)}</td>
                       <td>
-                        <div className="row-actions">
+                        <div className="row-actions row-actions-wrap">
                           <button disabled={busy} onClick={() => setEditing(alias)} title="编辑分组与备注">
                             <IconEdit size={14} />
                             编辑
                           </button>
+                          {entry?.token && (
+                            <button
+                              disabled={busy}
+                              onClick={() => void copyApiLink(alias.email)}
+                              title="复制「邮箱----取件链接」，对方打开就能看这个邮箱的邮件"
+                            >
+                              <IconCopy size={14} />
+                              复制链接
+                            </button>
+                          )}
+                          {state === 'issued' ? (
+                            <button
+                              disabled={busy}
+                              onClick={() => setConfirm({ type: 'revoke', alias })}
+                              title="撤销后这条取件链接立即失效，邮箱本身不受影响"
+                            >
+                              <IconKey size={14} />
+                              撤销链接
+                            </button>
+                          ) : (
+                            <button
+                              disabled={busy}
+                              onClick={() => void copyApiLink(alias.email)}
+                              title="生成并复制「邮箱----取件链接」"
+                            >
+                              <IconKey size={14} />
+                              取件链接
+                            </button>
+                          )}
                           {alias.active ? (
                             <button
                               disabled={busy}
@@ -864,6 +1222,8 @@ export default function AliasesPage() {
           groupId={meta[editing.email.toLowerCase()]?.group_id}
           note={meta[editing.email.toLowerCase()]?.note}
           groups={groups}
+          tags={tags}
+          tagIds={meta[editing.email.toLowerCase()]?.tag_ids ?? []}
           onClose={() => setEditing(null)}
           onSaved={(message) => {
             setEditing(null)
@@ -884,7 +1244,9 @@ export default function AliasesPage() {
           busy={busy}
           onClose={() => setConfirm(null)}
           onConfirm={() =>
-            'bulk' in confirm ? void runBulk(confirm.type) : void runAction(confirm.type)
+            'bulk' in confirm
+              ? void runBulk(confirm.type === 'revoke' ? 'revoke_token' : confirm.type)
+              : void runAction(confirm.type)
           }
         />
       )}

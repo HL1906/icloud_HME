@@ -272,7 +272,7 @@ func (c *WebClient) FindByAlias(alias string, limit int) ([]Message, error) {
 	// "主题里提到别名"的无关邮件也算进来,导致转发服务串号。
 	filtered := make([]Message, 0, limit)
 	for _, m := range raw {
-		if recipientMatches(m.To, alias) {
+		if RecipientMatches(m.To, alias) {
 			filtered = append(filtered, m)
 			if len(filtered) >= limit {
 				break
@@ -280,26 +280,6 @@ func (c *WebClient) FindByAlias(alias string, limit int) ([]Message, error) {
 		}
 	}
 	return filtered, nil
-}
-
-// recipientMatches 判断收件人字段中是否包含指定别名(大小写不敏感,按地址边界匹配)。
-func recipientMatches(to, alias string) bool {
-	to = strings.ToLower(to)
-	if to == "" || alias == "" {
-		return false
-	}
-	// 收件人可能是 "a@icloud.com, b@icloud.com",逐个比较避免子串误命中
-	for _, part := range strings.Split(to, ",") {
-		part = strings.TrimSpace(part)
-		// 去掉 "显示名 <addr>" 形式的外壳
-		if i := strings.LastIndex(part, "<"); i >= 0 {
-			part = strings.TrimSuffix(strings.TrimSpace(part[i+1:]), ">")
-		}
-		if part == alias {
-			return true
-		}
-	}
-	return false
 }
 
 // messageBatchResp 是 message/batch 接口的响应结构(threadId → 具体邮件列表)。

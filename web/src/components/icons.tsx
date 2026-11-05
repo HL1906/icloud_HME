@@ -37,6 +37,26 @@ export function IconGroups(props: IconProps) {
   )
 }
 
+/** 标注:标签形状(左端带孔),与分组的文件夹图标区分开。 */
+export function IconTag(props: IconProps) {
+  return (
+    <svg {...base(props)}>
+      <path d="M20.6 13.4 13.4 20.6a2 2 0 0 1-2.8 0l-7.2-7.2A2 2 0 0 1 2.8 12V4.8A2 2 0 0 1 4.8 2.8H12c.5 0 1 .2 1.4.6l7.2 7.2a2 2 0 0 1 0 2.8z" />
+      <circle cx="7.5" cy="7.5" r="1.2" />
+    </svg>
+  )
+}
+
+/** 设置:齿轮。 */
+export function IconSettings(props: IconProps) {
+  return (
+    <svg {...base(props)}>
+      <circle cx="12" cy="12" r="3" />
+      <path d="M12 2v2.5M12 19.5V22M4.2 4.2l1.8 1.8M18 18l1.8 1.8M2 12h2.5M19.5 12H22M4.2 19.8 6 18M18 6l1.8-1.8" />
+    </svg>
+  )
+}
+
 export function IconAliases(props: IconProps) {
   return (
     <svg {...base(props)}>

@@ -134,7 +134,7 @@ func (c *Client) authStart(state *authState) error {
 	}
 
 	req.Header.Set("Accept", "*/*")
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+	req.Header.Set("User-Agent", BrowserUA)
 
 	resp, err := c.httpc.Do(req)
 	if err != nil {

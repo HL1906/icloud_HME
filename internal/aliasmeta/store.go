@@ -12,6 +12,8 @@ package aliasmeta
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -27,14 +29,34 @@ import (
 
 // 字段上限。分组是给人看的短标签,不鼓励写长文;备注留 200 字符够用。
 const (
-	MaxGroups    = 100
-	MaxNameLen   = 40
-	MaxColorLen  = 32
-	MaxNoteLen   = 200
-	MaxEmailLen  = 320
-	fileName     = "alias_meta.json"
-	colorDefault = "blue"
+	MaxGroups   = 100
+	MaxNameLen  = 40
+	MaxColorLen = 32
+	MaxNoteLen  = 200
+	MaxEmailLen = 320
+	// MaxRevokeDays 是自动回收天数的上限:再长就不像"临时分发"了,
+	// 也更可能是填错了(把 30 填成 3000)。
+	MaxRevokeDays = 365
+	fileName      = "alias_meta.json"
+	colorDefault  = "blue"
 )
+
+// 分发状态。这是本系统自己的业务状态,与 iCloud 侧的 active(是否接收邮件)
+// 完全无关:一个别名可以"已分发"同时仍处于启用状态,也可以"已回收"但还没停用。
+const (
+	// StateStock 库存:已创建但还没发出去。
+	StateStock = "stock"
+	// StateIssued 已分发:已经发给某个人/某个客户。
+	StateIssued = "issued"
+	// StateRevoked 已回收:发出去过又收回来了(令牌已撤销)。
+	StateRevoked = "revoked"
+)
+
+// tokenLen 是取件令牌长度。62 进制 12 位 ≈ 71 bit,暴力枚举不可行;
+// 与 wdmail 那类服务保持同样的"邮箱:令牌"风格,便于人工抄写。
+const tokenLen = 12
+
+const tokenAlphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 
 var (
 	// ErrGroupNotFound 分组不存在。
@@ -51,22 +73,48 @@ var (
 	ErrInvalidEmail = errors.New("邮箱地址不合法")
 	// ErrNoteTooLong 备注过长。
 	ErrNoteTooLong = errors.New("备注最长 200 个字符")
+	// ErrInvalidState 分发状态取值非法。
+	ErrInvalidState = errors.New("分发状态只能是 stock / issued / revoked")
+	// ErrInvalidRevokeDays 自动回收天数超出范围。
+	ErrInvalidRevokeDays = errors.New("自动回收天数只能是 0-365")
+	// ErrTagNotFound 标注不存在。
+	ErrTagNotFound = errors.New("标注不存在")
+	// ErrTagNameEmpty 标注名为空。
+	ErrTagNameEmpty = errors.New("标注名不能为空")
+	// ErrTagNameTooLong 标注名过长。
+	ErrTagNameTooLong = errors.New("标注名最长 40 个字符")
+	// ErrTagNameTaken 标注名重复。
+	ErrTagNameTaken = errors.New("标注名已存在")
+	// ErrTagLimit 标注数量超限。
+	ErrTagLimit = errors.New("标注数量已达上限")
+	// ErrTagNoteTooLong 标注说明过长。
+	ErrTagNoteTooLong = errors.New("标注说明最长 120 个字符")
+	// ErrInvalidTagKind 标注分类取值非法。
+	ErrInvalidTagKind = errors.New("标注分类只能是 purpose / owner / other")
+	// ErrTooManyAliasTags 单个别名挂的标注太多。
+	ErrTooManyAliasTags = errors.New("单个邮箱最多挂 20 个标注")
 )
 
 // Group 是一个本地分组,仅用于本系统内的归类。
 type Group struct {
-	ID        string `json:"id"`
-	Name      string `json:"name"`
-	Color     string `json:"color"`
-	Note      string `json:"note,omitempty"`
-	CreatedAt string `json:"created_at"`
+	ID    string `json:"id"`
+	Name  string `json:"name"`
+	Color string `json:"color"`
+	Note  string `json:"note,omitempty"`
+	// RevokeAfterDays 是"该分组下的取件链接在签发多少天后自动回收"。
+	// 0 表示不自动回收。这是按分组下发的策略:同一批发出去的号
+	// 往往有相同的生命周期(比如试用 7 天、月付 30 天)。
+	// 只对已归入该分组的别名生效,未分组的别名永远不会被自动回收。
+	RevokeAfterDays int    `json:"revoke_after_days,omitempty"`
+	CreatedAt       string `json:"created_at"`
 }
 
 // GroupPatch 是分组的局部更新;nil 表示该字段不变。
 type GroupPatch struct {
-	Name  *string `json:"name"`
-	Color *string `json:"color"`
-	Note  *string `json:"note"`
+	Name            *string `json:"name"`
+	Color           *string `json:"color"`
+	Note            *string `json:"note"`
+	RevokeAfterDays *int    `json:"revoke_after_days"`
 }
 
 // Entry 是单个别名的本地元数据。邮箱是唯一键(小写)。
@@ -78,7 +126,32 @@ type Entry struct {
 	// LastReceivedAt 是扫描收件箱得出的"最近一次收到投递到该别名的时间"。
 	// 它只是 iCloud 收件箱内容的观测结果,不参与任何同步,清空也无副作用。
 	LastReceivedAt string `json:"last_received_at,omitempty"`
-	UpdatedAt      string `json:"updated_at"`
+
+	// State 是分发状态:stock(库存) / issued(已分发) / revoked(已回收)。
+	// 空值按"未标注"处理,页面归入库存。
+	State string `json:"state,omitempty"`
+	// Token 是该别名的取件令牌(明文)。它等价于一把钥匙:
+	// 拿到 "邮箱:令牌" 就能通过 /m 接口读这个别名收到的邮件。
+	// 文件权限 0600,与 accounts.json(含 iCloud Cookie)同级敏感。
+	Token string `json:"token,omitempty"`
+	// IssuedAt 是当前这条令牌的签发时间(也就是"分发时间")。
+	// 换新令牌时会刷新;回收后保留,便于追溯上一次分发是什么时候。
+	IssuedAt string `json:"issued_at,omitempty"`
+	// Recipient 是"发给谁"的本地备注(纯自由文本,不会同步到 iCloud,
+	// 也绝不要写进 iCloud 的 label —— 那个字段存在 Apple 服务器上)。
+	Recipient string `json:"recipient,omitempty"`
+	// TagIDs 是该别名挂着的标注 ID 列表(见 tags.go)。
+	// 与 iCloud 的 label 无关:label 建号后不可改,标注随时可增删。
+	TagIDs []string `json:"tag_ids,omitempty"`
+
+	// RevokedTokenHashes 是已失效取件令牌的 SHA-256 指纹(只存哈希,不存明文)。
+	//
+	// 用途单一:对方拿着一张过期链接打开时,能认出"这个链接存在过但已失效",
+	// 从而给出"链接已失效"的提示,而不是让人以为地址打错了。
+	// 存哈希而非明文,即使 alias_meta.json 泄露也无法还原出可用链接。
+	RevokedTokenHashes []string `json:"revoked_token_hashes,omitempty"`
+
+	UpdatedAt string `json:"updated_at"`
 }
 
 // Activity 是某个账号最近一次收信活动扫描的摘要。
@@ -97,6 +170,7 @@ type Activity struct {
 type Store struct {
 	mu       sync.Mutex
 	groups   []Group
+	tags     []Tag
 	entries  map[string]Entry
 	activity map[string]Activity
 	file     string
@@ -134,8 +208,9 @@ func (s *Store) load() error {
 		return err
 	}
 	var wrapper struct {
-		Groups   []Group          `json:"groups"`
-		Entries  map[string]Entry `json:"entries"`
+		Groups   []Group             `json:"groups"`
+		Tags     []Tag               `json:"tags"`
+		Entries  map[string]Entry    `json:"entries"`
 		Activity map[string]Activity `json:"activity"`
 	}
 	if err := json.Unmarshal(raw, &wrapper); err != nil {
@@ -143,6 +218,12 @@ func (s *Store) load() error {
 	}
 	if len(wrapper.Groups) > 0 {
 		s.groups = wrapper.Groups
+	}
+	if len(wrapper.Tags) > 0 {
+		s.tags = wrapper.Tags
+		for i := range s.tags {
+			s.tags[i].Kind = normalizeTagKind(s.tags[i].Kind)
+		}
 	}
 	if len(wrapper.Activity) > 0 {
 		s.activity = wrapper.Activity
@@ -161,9 +242,17 @@ func (s *Store) load() error {
 	for key, entry := range s.entries {
 		if entry.GroupID != "" && !s.groupExistsLocked(entry.GroupID) {
 			entry.GroupID = ""
-			s.entries[key] = entry
 		}
+		// 状态与令牌互相校正:有令牌一定算"已分发",状态值非法则清空(按未标注处理)
+		if entry.Token != "" {
+			entry.State = StateIssued
+		} else if entry.State != StateStock && entry.State != StateIssued && entry.State != StateRevoked {
+			entry.State = ""
+		}
+		s.entries[key] = entry
 	}
+	// 标注被手工删掉后,残留的 tag_id 视为无效
+	s.cleanupTagsLocked()
 	return nil
 }
 
@@ -173,12 +262,14 @@ func (s *Store) saveLocked() error {
 		return nil
 	}
 	wrapper := struct {
-		Groups    []Group            `json:"groups"`
-		Entries   map[string]Entry   `json:"entries"`
+		Groups    []Group             `json:"groups"`
+		Tags      []Tag               `json:"tags,omitempty"`
+		Entries   map[string]Entry    `json:"entries"`
 		Activity  map[string]Activity `json:"activity,omitempty"`
-		UpdatedAt string             `json:"updated_at"`
+		UpdatedAt string              `json:"updated_at"`
 	}{
 		Groups:    s.groups,
+		Tags:      s.tags,
 		Entries:   s.entries,
 		Activity:  s.activity,
 		UpdatedAt: s.now().Format(time.RFC3339),
@@ -315,6 +406,13 @@ func (s *Store) UpdateGroup(id string, patch GroupPatch) (Group, error) {
 		}
 		next.Note = note
 	}
+	if patch.RevokeAfterDays != nil {
+		days := *patch.RevokeAfterDays
+		if days < 0 || days > MaxRevokeDays {
+			return Group{}, ErrInvalidRevokeDays
+		}
+		next.RevokeAfterDays = days
+	}
 
 	s.groups[idx] = next
 	if err := s.saveLocked(); err != nil {
@@ -392,8 +490,8 @@ func (s *Store) Upsert(email, accountID, groupID, note string) (Entry, error) {
 		if !ok {
 			return Entry{Email: key}, nil
 		}
-		if prev.LastReceivedAt != "" {
-			// 还有收信记录,不能整条删掉,只清分组与备注
+		if prev.LastReceivedAt != "" || prev.Token != "" || prev.State != "" || len(prev.TagIDs) > 0 {
+			// 还有收信记录 / 取件令牌 / 分发状态 / 标注,不能整条删掉,只清分组与备注
 			next := prev
 			next.GroupID, next.Note, next.UpdatedAt = "", "", s.now().Format(time.RFC3339)
 			s.entries[key] = next
@@ -423,8 +521,14 @@ func (s *Store) Upsert(email, accountID, groupID, note string) (Entry, error) {
 		entry.AccountID = prev.AccountID
 	}
 	if hadPrev {
-		// 收信时间是观测结果,编辑分组/备注不应该丢掉它
+		// 收信时间是观测结果,编辑分组/备注不应该丢掉它;
+		// 取件令牌与分发状态同理——它们和分组是两套独立信息。
 		entry.LastReceivedAt = prev.LastReceivedAt
+		entry.State = prev.State
+		entry.Token = prev.Token
+		entry.IssuedAt = prev.IssuedAt
+		entry.Recipient = prev.Recipient
+		entry.TagIDs = prev.TagIDs
 	}
 	s.entries[key] = entry
 	if err := s.saveLocked(); err != nil {
@@ -485,8 +589,12 @@ func (s *Store) AssignGroupBulk(emails []string, accountID, groupID string) (int
 			GroupID:   groupID,
 			Note:      old.Note,
 			UpdatedAt: updatedAt,
-			// 归组不改变收信事实,照原样保留
+			// 归组不改变收信事实,也不改变分发状态/取件令牌,照原样保留
 			LastReceivedAt: old.LastReceivedAt,
+			State:          old.State,
+			Token:          old.Token,
+			IssuedAt:       old.IssuedAt,
+			Recipient:      old.Recipient,
 		}
 		if next.AccountID == "" {
 			next.AccountID = old.AccountID
@@ -613,6 +721,313 @@ func (s *Store) DeleteEntry(email string) (bool, error) {
 	return true, nil
 }
 
+// ====================================================================
+// 分发:取件令牌与分发状态
+//
+// 一个别名分发给一个人,凭证就是 "邮箱:令牌"。令牌只授予"读这个别名的邮件",
+// 不授予任何管理能力,也不暴露账号信息——这是整套分发功能的权限边界。
+// ====================================================================
+
+// tokenAlphabetLimit 是拒绝采样的上界(256 里最大的 62 的整数倍),
+// 用它取模可以消除偏置,保证每个字符等概率。
+const tokenAlphabetLimit = 256 - 256%len(tokenAlphabet)
+
+// NewToken 生成一个取件令牌(62 进制,12 位)。
+func NewToken() (string, error) {
+	out := make([]byte, 0, tokenLen)
+	buf := make([]byte, 32)
+	for len(out) < tokenLen {
+		if _, err := rand.Read(buf); err != nil {
+			return "", err
+		}
+		for _, b := range buf {
+			if int(b) >= tokenAlphabetLimit {
+				continue
+			}
+			out = append(out, tokenAlphabet[int(b)%len(tokenAlphabet)])
+			if len(out) == tokenLen {
+				break
+			}
+		}
+	}
+	return string(out), nil
+}
+
+// tokenHash 把令牌算成 SHA-256 十六进制指纹。
+//
+// 令牌本身有 62^12 种可能,不需要加盐:目的不是抗暴力破解,
+// 而是"文件泄露时不能直接还原出可用链接"。也正因为是定长哈希,
+// 比较时不需要再考虑时序攻击。
+func tokenHash(token string) string {
+	sum := sha256.Sum256([]byte(strings.TrimSpace(token)))
+	return hex.EncodeToString(sum[:])
+}
+
+// maxRevokedHashes 是每个别名保留的失效令牌指纹上限。
+//
+// 正常使用最多轮换几次,留 8 个足够认出"最近用过的过期链接";
+// 不设上限的话,一个被反复轮换的别名会让文件无限增长。
+const maxRevokedHashes = 8
+
+// rememberRevokedLocked 把即将作废的令牌指纹记进条目(调用方需持有锁)。
+//
+// 已经是空的令牌不记(那不是"作废",而是本来就没有)。
+func rememberRevokedLocked(entry *Entry, token string) {
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return
+	}
+	h := tokenHash(token)
+	for _, existing := range entry.RevokedTokenHashes {
+		if existing == h {
+			return
+		}
+	}
+	entry.RevokedTokenHashes = append(entry.RevokedTokenHashes, h)
+	// 只保留最近的若干个,老的直接丢掉
+	if n := len(entry.RevokedTokenHashes); n > maxRevokedHashes {
+		entry.RevokedTokenHashes = entry.RevokedTokenHashes[n-maxRevokedHashes:]
+	}
+}
+
+// IssueToken 为别名签发取件令牌,并把分发状态置为 issued。
+//
+// 幂等:已有令牌且 rotate=false 时直接返回原令牌,避免管理员反复点"生成"
+// 把已经发出去的链接弄失效。需要换新令牌时显式传 rotate=true。
+// recipient 非空时一并记下"发给谁"(纯本地信息,不会同步到 iCloud)。
+func (s *Store) IssueToken(email, accountID, recipient string, rotate bool) (Entry, error) {
+	key := normalizeEmail(email)
+	if key == "" {
+		return Entry{}, ErrInvalidEmail
+	}
+	recipient = strings.TrimSpace(recipient)
+	if len([]rune(recipient)) > MaxNoteLen {
+		return Entry{}, ErrNoteTooLong
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	prev, had := s.entries[key]
+	next := prev
+	next.Email = key
+	if acc := strings.TrimSpace(accountID); acc != "" {
+		next.AccountID = acc
+	}
+	if recipient != "" {
+		next.Recipient = recipient
+	}
+	if had && next.Token != "" && !rotate {
+		// Entry 含切片(TagIDs)不可整体比较;上面只可能改到账号与"发给谁",
+		// 比较这两个字段等价于判断有没有变化。
+		if next.AccountID != prev.AccountID || next.Recipient != prev.Recipient {
+			next.UpdatedAt = s.now().Format(time.RFC3339)
+			s.entries[key] = next
+			if err := s.saveLocked(); err != nil {
+				s.entries[key] = prev
+				return Entry{}, err
+			}
+		}
+		return next, nil
+	}
+
+	token, err := NewToken()
+	if err != nil {
+		return Entry{}, err
+	}
+	now := s.now().Format(time.RFC3339)
+	// 轮换会作废旧令牌:先记指纹,让对方拿旧链接来能看到"已失效"
+	if rotate && next.Token != "" {
+		rememberRevokedLocked(&next, next.Token)
+	}
+	next.Token = token
+	next.State = StateIssued
+	// 每次生成新令牌都刷新签发时间:它是"这条链接从什么时候开始生效",
+	// 自动回收按它起算。幂等复用原令牌的路径在上面已经返回,不会走到这里,
+	// 所以管理员反复点"复制链接"不会把回收时间往后推。
+	next.IssuedAt = now
+	next.UpdatedAt = now
+
+	s.entries[key] = next
+	if err := s.saveLocked(); err != nil {
+		if had {
+			s.entries[key] = prev
+		} else {
+			delete(s.entries, key)
+		}
+		return Entry{}, err
+	}
+	return next, nil
+}
+
+// RevokeToken 撤销取件令牌(链接立即失效),状态置为 revoked。
+func (s *Store) RevokeToken(email string) (Entry, error) {
+	key := normalizeEmail(email)
+	if key == "" {
+		return Entry{}, ErrInvalidEmail
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	prev, ok := s.entries[key]
+	if !ok || prev.Token == "" {
+		return prev, nil
+	}
+	next := prev
+	rememberRevokedLocked(&next, prev.Token)
+	next.Token = ""
+	next.State = StateRevoked
+	next.UpdatedAt = s.now().Format(time.RFC3339)
+	s.entries[key] = next
+	if err := s.saveLocked(); err != nil {
+		s.entries[key] = prev
+		return Entry{}, err
+	}
+	return next, nil
+}
+
+// SetState 手工设置分发状态。
+//
+// 语义上的硬约束:只要状态不是 issued,就不能留着一个还能用的令牌——
+// 否则界面显示"库存",链接却依然能读到邮件,是最容易出事的那种不一致。
+func (s *Store) SetState(email, state string) (Entry, error) {
+	key := normalizeEmail(email)
+	if key == "" {
+		return Entry{}, ErrInvalidEmail
+	}
+	state = strings.TrimSpace(state)
+	if state != StateStock && state != StateIssued && state != StateRevoked {
+		return Entry{}, ErrInvalidState
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	prev, had := s.entries[key]
+	next := prev
+	next.Email = key
+	next.State = state
+	if state != StateIssued {
+		rememberRevokedLocked(&next, prev.Token)
+		next.Token = ""
+	}
+	next.UpdatedAt = s.now().Format(time.RFC3339)
+	s.entries[key] = next
+	if err := s.saveLocked(); err != nil {
+		if had {
+			s.entries[key] = prev
+		} else {
+			delete(s.entries, key)
+		}
+		return Entry{}, err
+	}
+	return next, nil
+}
+
+// ExpiredTokens 返回"按所属分组的策略已经到期"的已分发别名。
+//
+// 规则很简单,但边界必须说清楚:
+//   - 只考虑还持有令牌的别名(已回收的没什么可回收);
+//   - 只考虑归入某个分组的别名,未分组的永远不会被自动回收;
+//   - 分组策略为 0 表示不自动回收;
+//   - 起算点是 IssuedAt(当前这条令牌的签发时间),不是创建时间。
+//
+// 返回按到期时间升序,调用方逐个 RevokeToken 即可。
+func (s *Store) ExpiredTokens(now time.Time) []Entry {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	policies := make(map[string]int, len(s.groups))
+	for _, g := range s.groups {
+		policies[g.ID] = g.RevokeAfterDays
+	}
+
+	type expired struct {
+		entry Entry
+		due   time.Time
+	}
+	var hits []expired
+	for _, entry := range s.entries {
+		if entry.Token == "" || entry.GroupID == "" {
+			continue
+		}
+		days := policies[entry.GroupID]
+		if days <= 0 {
+			continue
+		}
+		issued, err := time.Parse(time.RFC3339, entry.IssuedAt)
+		if err != nil {
+			// 时间戳坏了就不动它:宁可少回收,也不能凭一个解析不出的值删链接
+			continue
+		}
+		due := issued.Add(time.Duration(days) * 24 * time.Hour)
+		if now.Before(due) {
+			continue
+		}
+		hits = append(hits, expired{entry: entry, due: due})
+	}
+
+	sort.Slice(hits, func(i, j int) bool {
+		if hits[i].due.Equal(hits[j].due) {
+			return hits[i].entry.Email < hits[j].entry.Email
+		}
+		return hits[i].due.Before(hits[j].due)
+	})
+
+	out := make([]Entry, len(hits))
+	for i := range hits {
+		out[i] = hits[i].entry
+	}
+	return out
+}
+
+// ByToken 按取件令牌查找别名。
+//
+// 逐个常量时间比较且不提前返回:令牌是纯 bearer 凭证,
+// 不留"第几条命中"的时序特征。条目数在几百到几千量级,线性扫描足够快。
+func (s *Store) ByToken(token string) (Entry, bool) {
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return Entry{}, false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var found Entry
+	ok := false
+	for _, entry := range s.entries {
+		if entry.Token == "" {
+			continue
+		}
+		if subtle.ConstantTimeCompare([]byte(entry.Token), []byte(token)) == 1 {
+			found = entry
+			ok = true
+		}
+	}
+	return found, ok
+}
+
+// RevokedToken 判断 token 是否"曾经有效、后来被作废"。
+//
+// 返回命中的别名(邮箱地址),用于对方拿到过期链接时给出
+// "这个链接已失效"的明确提示,而不是含糊的 404。
+//
+// 只对已作废的令牌返回 true；仍在使用的令牌请用 ByToken。
+func (s *Store) RevokedToken(token string) (string, bool) {
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return "", false
+	}
+	h := tokenHash(token)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, entry := range s.entries {
+		for _, known := range entry.RevokedTokenHashes {
+			if subtle.ConstantTimeCompare([]byte(known), []byte(h)) == 1 {
+				return entry.Email, true
+			}
+		}
+	}
+	return "", false
+}
+
 // ResetEntries 清空全部别名元数据(保留分组定义)。
 //
 // 演示模式下别名列表是进程内存里的假数据,重启后邮箱名会重新生成,
@@ -671,7 +1086,8 @@ func (s *Store) DeleteByAccount(accountID string) (int, error) {
 
 // isBlank 判断一条记录是否只剩下"邮箱"这个键,没有任何值得保存的信息。
 func isBlank(e Entry) bool {
-	return e.GroupID == "" && e.Note == "" && e.LastReceivedAt == ""
+	return e.GroupID == "" && e.Note == "" && e.LastReceivedAt == "" &&
+		e.State == "" && e.Token == "" && e.Recipient == ""
 }
 
 func (s *Store) groupExistsLocked(id string) bool {
@@ -702,9 +1118,19 @@ func normalizeColor(color string) string {
 
 // newID 生成分组 ID。用随机值而非自增,避免删除后重建撞上旧引用。
 func newID() string {
+	return newPrefixedID("g_")
+}
+
+// newTagID 生成标注 ID。前缀刻意与分组区分开:
+// 两者都会出现在界面和 URL 里,前缀不同才不会看错。
+func newTagID() string {
+	return newPrefixedID("t_")
+}
+
+func newPrefixedID(prefix string) string {
 	buf := make([]byte, 6)
 	if _, err := rand.Read(buf); err != nil {
-		return "g_" + time.Now().Format("150405.000000")
+		return prefix + time.Now().Format("150405.000000")
 	}
-	return "g_" + hex.EncodeToString(buf)
+	return prefix + hex.EncodeToString(buf)
 }

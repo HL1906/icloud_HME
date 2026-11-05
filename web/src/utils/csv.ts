@@ -53,3 +53,21 @@ export function timestampedName(prefix: string, extension = 'csv'): string {
   const stamp = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}`
   return `${prefix}-${stamp}.${extension}`
 }
+
+/**
+ * 生成纯文本文件并下载。
+ *
+ * 用于分发清单（每行一条 "邮箱----取件链接"）：这种内容不需要表格，
+ * 用 txt 反而更方便直接贴进聊天窗口，或喂给别人的脚本。
+ */
+export function downloadText(filename: string, text: string): void {
+  const blob = new Blob([text], { type: 'text/plain;charset=utf-8' })
+  const url = URL.createObjectURL(blob)
+  const link = document.createElement('a')
+  link.href = url
+  link.download = filename
+  document.body.appendChild(link)
+  link.click()
+  link.remove()
+  setTimeout(() => URL.revokeObjectURL(url), 0)
+}

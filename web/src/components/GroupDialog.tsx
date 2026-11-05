@@ -21,6 +21,7 @@ export default function GroupDialog({ open, group, onClose, onSaved }: GroupDial
   const [name, setName] = useState(group?.name ?? '')
   const [color, setColor] = useState(group?.color ?? 'blue')
   const [note, setNote] = useState(group?.note ?? '')
+  const [revokeAfterDays, setRevokeAfterDays] = useState(group?.revoke_after_days ?? 0)
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
 
@@ -32,17 +33,23 @@ export default function GroupDialog({ open, group, onClose, onSaved }: GroupDial
     }
     setBusy(true)
     setError('')
+    const payload = {
+      name: name.trim(),
+      color,
+      note: note.trim(),
+      revoke_after_days: revokeAfterDays,
+    }
     try {
       if (group) {
         await request(`/api/groups/${encodeURIComponent(group.id)}`, {
           method: 'PATCH',
-          body: JSON.stringify({ name: name.trim(), color, note: note.trim() }),
+          body: JSON.stringify(payload),
         })
         onSaved('分组已更新')
       } else {
         await request('/api/groups', {
           method: 'POST',
-          body: JSON.stringify({ name: name.trim(), color, note: note.trim() }),
+          body: JSON.stringify(payload),
         })
         onSaved('分组已创建')
       }
@@ -90,8 +97,27 @@ export default function GroupDialog({ open, group, onClose, onSaved }: GroupDial
           onChange={(e) => setNote(e.target.value.slice(0, 200))}
         />
       </div>
+      <div className="form-field">
+        <label htmlFor="group-revoke">自动回收取件链接</label>
+        <select
+          id="group-revoke"
+          value={revokeAfterDays}
+          onChange={(e) => setRevokeAfterDays(Number(e.target.value))}
+        >
+          <option value={0}>不自动回收</option>
+          <option value={1}>签发 1 天后</option>
+          <option value={3}>签发 3 天后</option>
+          <option value={7}>签发 7 天后</option>
+          <option value={14}>签发 14 天后</option>
+          <option value={30}>签发 30 天后</option>
+          <option value={90}>签发 90 天后</option>
+        </select>
+      </div>
       <p className="hint">
         分组只存在本系统，用于你自己归类；不会写入 iCloud，也不影响邮箱地址。
+        <br />
+        自动回收按「签发时间」起算，只对本分组内、已经发出去的链接生效；未分组的邮箱永远不会被自动回收。
+        回收只是让链接失效，邮箱本身还在，之后可以重新签发。
       </p>
       <div className="form-actions">
         <button onClick={onClose} disabled={busy}>

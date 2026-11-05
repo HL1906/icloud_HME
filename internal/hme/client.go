@@ -26,6 +26,12 @@ const (
 	// ClientBuildNumber 是 iCloud Web 客户端构建号,从浏览器抓包获取。
 	// maildomainws (HME 别名管理) 专用。
 	ClientBuildNumber = "2624Build22"
+	// BrowserUA 是所有 iCloud 请求统一使用的 User-Agent。
+	//
+	// 必须与 sec-ch-ua 声明的主版本保持一致,且全局只此一份:
+	// 同一次登录里 UA 版本跳变(业务请求 147、认证请求 124)是明显的
+	// 非浏览器特征,Apple 侧可以据此把流量归为脚本。
+	BrowserUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36"
 	// ClientMasteringNumber 是 iCloud Web 客户端主版本号。
 	ClientMasteringNumber = "2624Build22"
 	// DefaultBuildNumber 用于 validate 和 mccgateway (邮件) 等非 HME 端点。
@@ -79,7 +85,12 @@ type Client struct {
 	setupURL    string
 	serviceURL  string
 	dsid        string // 从 validate 响应提取
-	clientID    string // UUID,每次会话生成
+	// ClientID 是 iCloud Web 客户端的标识,浏览器一个会话固定用一个。
+	//
+	// 调用方应当传入持久化的值(见 account.Account.ClientID):同一个 Cookie
+	// 若每次请求都配一个全新的 clientId,在 Apple 侧就是"同一会话被一串
+	// 不同客户端使用",属于明显的非浏览器特征。为空时退化为随机值。
+	ClientID    string
 	accountInfo *AccountInfo
 	// mu 保护 Cookies(iCloud 会在响应里通过 Set-Cookie 刷新 token)
 	mu sync.RWMutex
@@ -178,7 +189,7 @@ func NewClient(cookies map[string]string, host, proxy string, verbose bool) (*Cl
 		Proxy:    proxy,
 		Verbose:  verbose,
 		httpc:    httpc,
-		clientID: uuid.New().String(),
+		ClientID: uuid.New().String(),
 	}
 
 	// 把传入的 Cookie 灌入 jar,后续请求自动携带。
@@ -278,8 +289,8 @@ func (c *Client) buildURL(rawURL string) string {
 		q.Set("clientBuildNumber", DefaultBuildNumber)
 		q.Set("clientMasteringNumber", DefaultBuildNumber)
 	}
-	if c.clientID != "" {
-		q.Set("clientId", c.clientID)
+	if c.ClientID != "" {
+		q.Set("clientId", c.ClientID)
 	}
 	if c.dsid != "" {
 		q.Set("dsid", c.dsid)
@@ -353,7 +364,7 @@ func (c *Client) request(method, rawURL string, body any, timeout time.Duration,
 		req.Header.Set("sec-ch-ua", `"Google Chrome";v="147", "Not.A/Brand";v="8", "Chromium";v="147"`)
 		req.Header.Set("sec-ch-ua-mobile", "?0")
 		req.Header.Set("sec-ch-ua-platform", `"Windows"`)
-		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36")
+		req.Header.Set("User-Agent", BrowserUA)
 
 		// 手动添加 Cookie 头(确保跨域也能传递),并同步刷新 cookie jar
 		if cookieHeader := c.prepareCookies(fullURL); cookieHeader != "" {
@@ -517,6 +528,17 @@ func (c *Client) resolveService() error {
 	return nil
 }
 
+// ListAliasesRaw 返回 /v2/hme/list 的原始响应体,仅供只读排查。
+//
+// 响应里含别名地址与 note 等用户数据,调用方必须脱敏后再输出,
+// 不要整体写进常驻日志。
+func (c *Client) ListAliasesRaw() (string, error) {
+	if err := c.resolveService(); err != nil {
+		return "", err
+	}
+	return c.request("GET", c.serviceURL+"/v2/hme/list", nil, 0, MaxRetries)
+}
+
 // ListAliases 列出当前账号所有 Hide My Email 别名。
 func (c *Client) ListAliases() ([]Alias, error) {
 	if err := c.resolveService(); err != nil {
@@ -568,10 +590,16 @@ func (c *Client) Reserve(hme, label string) (string, error) {
 		label = "Created " + time.Now().Format("2006-01-02 15:04")
 	}
 	c.log("保留别名 %s ...", hme)
+	// note 必须留空,绝不能写工具名或任何固定字符串。
+	//
+	// reserve 的 note 会被 Apple 存进别名记录(且 list 会回传),它不像 UA
+	// 或 TLS 指纹那样需要推测——一条 WHERE note='...' 就能把全网用本工具
+	// 建的别名精确圈出来,并顺着 dsid 关联到账号。真实用户不填备注时
+	// 这个字段就是空串,保持空串即与正常用户不可区分。
 	payload := map[string]string{
 		"hme":   hme,
 		"label": label,
-		"note":  "Created by icloud_hme tool",
+		"note":  "",
 	}
 	body, err := c.request("POST", c.serviceURL+"/v1/hme/reserve", payload, 0, 2)
 	if err != nil {

@@ -1,4 +1,12 @@
-import { useCallback, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react'
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+  type MouseEvent as ReactMouseEvent,
+  type ReactNode,
+} from 'react'
 import { createPortal } from 'react-dom'
 
 interface DropdownMenuProps {
@@ -70,21 +78,24 @@ export default function DropdownMenu({ label, trigger, children, align = 'right'
     window.addEventListener('scroll', onScroll, true)
     window.addEventListener('resize', onScroll)
 
-    // 点击菜单内的操作项后自动关闭(用原生监听,避免给容器加交互属性)
-    const menuEl = menuRef.current
-    function onMenuClick(e: MouseEvent) {
-      if ((e.target as HTMLElement).closest('button, a')) close()
-    }
-    menuEl?.addEventListener('click', onMenuClick)
-
     return () => {
       document.removeEventListener('mousedown', onPointerDown)
       document.removeEventListener('keydown', onKeyDown)
       window.removeEventListener('scroll', onScroll, true)
       window.removeEventListener('resize', onScroll)
-      menuEl?.removeEventListener('click', onMenuClick)
     }
   }, [open, close])
+
+  // 点击菜单内的操作项后自动关闭。
+  //
+  // 必须用 React 的冒泡阶段处理:子项 onClick 先执行,事件冒到容器再关闭。
+  // 早期版本用原生 addEventListener('click') 挂在菜单容器上,它在 React
+  // 合成事件派发之前触发,setOpen(false) 会同步卸载菜单(React 对"非 React
+  // 事件里触发的更新"会同步刷新),等事件冒泡到 body 时按钮已被卸载,
+  // 子项的 onClick 永远收不到 —— 表现为点菜单项完全没反应。
+  const handleMenuClick = (e: ReactMouseEvent<HTMLDivElement>) => {
+    if ((e.target as HTMLElement).closest('button, a')) close()
+  }
 
   return (
     <>
@@ -106,6 +117,7 @@ export default function DropdownMenu({ label, trigger, children, align = 'right'
             className="dropdown-menu"
             role="menu"
             tabIndex={-1}
+            onClick={handleMenuClick}
             style={pos ? { top: pos.top, left: pos.left } : { top: -9999, left: -9999 }}
           >
             {children}

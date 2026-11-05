@@ -28,12 +28,24 @@ func mapMetaErr(c *gin.Context, err error) {
 	switch {
 	case errors.Is(err, aliasmeta.ErrGroupNotFound):
 		failCode(c, http.StatusNotFound, "GROUP_NOT_FOUND", "分组不存在")
+	case errors.Is(err, aliasmeta.ErrTagNotFound):
+		failCode(c, http.StatusNotFound, "TAG_NOT_FOUND", "标注不存在")
 	case errors.Is(err, aliasmeta.ErrGroupNameTaken):
 		failCode(c, http.StatusBadRequest, "GROUP_NAME_TAKEN", "分组名已存在")
+	case errors.Is(err, aliasmeta.ErrTagNameTaken):
+		failCode(c, http.StatusBadRequest, "TAG_NAME_TAKEN", "标注名已存在")
 	case errors.Is(err, aliasmeta.ErrGroupNameEmpty),
 		errors.Is(err, aliasmeta.ErrGroupNameTooLong),
 		errors.Is(err, aliasmeta.ErrGroupLimit),
 		errors.Is(err, aliasmeta.ErrNoteTooLong),
+		errors.Is(err, aliasmeta.ErrInvalidState),
+		errors.Is(err, aliasmeta.ErrInvalidRevokeDays),
+		errors.Is(err, aliasmeta.ErrTagNameEmpty),
+		errors.Is(err, aliasmeta.ErrTagNameTooLong),
+		errors.Is(err, aliasmeta.ErrTagLimit),
+		errors.Is(err, aliasmeta.ErrTagNoteTooLong),
+		errors.Is(err, aliasmeta.ErrInvalidTagKind),
+		errors.Is(err, aliasmeta.ErrTooManyAliasTags),
 		errors.Is(err, aliasmeta.ErrInvalidEmail):
 		failCode(c, http.StatusBadRequest, "VALIDATION_ERROR", err.Error())
 	default:
@@ -61,6 +73,8 @@ type groupReq struct {
 	Name  string `json:"name"`
 	Color string `json:"color"`
 	Note  string `json:"note"`
+	// RevokeAfterDays 是建组时一并设置的自动回收天数,0 表示不自动回收。
+	RevokeAfterDays int `json:"revoke_after_days"`
 }
 
 // createGroupHandler 处理 POST /api/groups。
@@ -74,6 +88,16 @@ func (s *Server) createGroupHandler(c *gin.Context) {
 	if err != nil {
 		mapMetaErr(c, err)
 		return
+	}
+	// 建组接口的签名保持不动(自动回收是后加的能力),需要时补一次局部更新。
+	// 分组是低频操作,多一次落盘不值得为此改一圈调用方。
+	if req.RevokeAfterDays != 0 {
+		days := req.RevokeAfterDays
+		group, err = s.meta.UpdateGroup(group.ID, aliasmeta.GroupPatch{RevokeAfterDays: &days})
+		if err != nil {
+			mapMetaErr(c, err)
+			return
+		}
 	}
 	ok(c, groupView{Group: group})
 }
@@ -126,6 +150,9 @@ type aliasMetaReq struct {
 	AccountID string `json:"account_id"`
 	GroupID   string `json:"group_id"`
 	Note      string `json:"note"`
+	// State 可选:stock / issued / revoked。为空表示不改分发状态。
+	// 把状态改回 stock/revoked 会顺带撤销取件令牌,避免"界面显示库存但链接还能用"。
+	State string `json:"state"`
 }
 
 // putAliasMetaHandler 处理 PUT /api/alias-meta。
@@ -145,6 +172,13 @@ func (s *Server) putAliasMetaHandler(c *gin.Context) {
 	if err != nil {
 		mapMetaErr(c, err)
 		return
+	}
+	if state := strings.TrimSpace(req.State); state != "" {
+		entry, err = s.meta.SetState(req.Email, state)
+		if err != nil {
+			mapMetaErr(c, err)
+			return
+		}
 	}
 	ok(c, entry)
 }

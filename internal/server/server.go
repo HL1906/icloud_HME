@@ -33,6 +33,7 @@ import (
 	"icloud-hme/internal/auth"
 	"icloud-hme/internal/forward"
 	"icloud-hme/internal/pool"
+	"icloud-hme/internal/settings"
 	"icloud-hme/internal/webui"
 )
 
@@ -44,9 +45,9 @@ type Config struct {
 	SecureCookie  bool
 	// DataDir 是持久化目录(转发标记等)。为空时使用当前目录。
 	DataDir string
-	// Demo 开启演示模式:别名列表改用内存假数据,不访问 iCloud。
-	// 用于在账号尚未配置好时预览界面与调试自动化脚本。
-	Demo bool
+	// PublicBaseURL 是分发出去的取件链接前缀(如 https://mail.example.com)。
+	// 为空时按请求的 Host 推导。
+	PublicBaseURL string
 }
 
 // Server 封装 Gin 引擎、账号后端与认证。
@@ -63,6 +64,16 @@ type Server struct {
 	// scanMu/scanning 防止同一账号并发扫描收件箱(纯浪费上游连接)
 	scanMu   sync.Mutex
 	scanning map[string]bool
+	// 取件接口(/m)的限流与短时缓存:对外暴露,必须自带防刷
+	pubLimiter *publicLimiter
+	pubCache   *publicCache
+	// 取件链接的自动回收协程(仅在 Run 时启动)
+	sweepMu   sync.Mutex
+	sweepStop chan struct{}
+	// settings 是运行时可改的设置(自动回收开关/间隔、取件页默认值、对外域名)
+	settings *settings.Store
+	// createLimiter 限制每个账号每分钟的建号数,保护上游不被风控
+	createLimiter *createLimiter
 }
 
 // New 创建 Server。mgr 为账号管理器,cfg 为安全配置。
@@ -74,10 +85,6 @@ func New(mgr *account.Manager, cfg Config) (*Server, error) {
 		be.forward = store
 	} else {
 		log.Printf("[server] 转发标记存储不可用,转发去重已禁用: %v", err)
-	}
-	if cfg.Demo {
-		be.demo = newDemoStore()
-		log.Printf("[server] 演示模式已开启:别名接口返回内存假数据,不会写入 iCloud 账号")
 	}
 	return newWithBackend(be, cfg)
 }
@@ -100,6 +107,9 @@ func newWithBackend(be Backend, cfg Config) (*Server, error) {
 		limiter:  auth.NewLimiter(nil, 15*time.Minute, 5, 10000).WithGlobalLimit(300),
 		cfg:      cfg,
 		scanning: make(map[string]bool),
+		// 取件接口对外:按 IP / 令牌各 60 次每分钟,全站 600 次每分钟
+		pubLimiter: newPublicLimiter(time.Minute, 60, 600),
+		pubCache:   newPublicCache(publicCacheTTL),
 	}
 	authMgr, err := auth.NewManager(auth.Options{
 		Password:       cfg.AdminPassword,
@@ -119,12 +129,15 @@ func newWithBackend(be Backend, cfg Config) (*Server, error) {
 		meta, _ = aliasmeta.NewStore("")
 	}
 	s.meta = meta
-	if cfg.Demo {
-		// 演示别名是内存里的假数据,重启后邮箱名会变;旧的归属记录留着只会让分组计数虚高
-		if err := meta.ResetEntries(); err != nil {
-			log.Printf("[server] 演示模式清理别名元数据失败: %v", err)
-		}
+
+	// 运行时设置:自动回收开关/间隔、取件页默认值、对外域名。
+	settingsStore, serr := settings.NewStore(cfg.DataDir)
+	if serr != nil {
+		log.Printf("[server] 设置存储初始化失败,改用默认设置: %v", serr)
+		settingsStore, _ = settings.NewStore("")
 	}
+	s.settings = settingsStore
+	s.createLimiter = newCreateLimiter()
 
 	// 别名池自动补号:配置和数据都落 DataDir。
 	// 没有数据目录就不启用,避免把 alias_pool.json 写进当前工作目录。
@@ -180,6 +193,8 @@ func (s *Server) Run(addr string) error {
 
 	// 监听失败的错误通过 channel 回传,避免在 goroutine 里直接退出进程
 	errCh := make(chan error, 1)
+	// 到期取件链接的后台回收:只在真正跑服务时启动,测试里不起协程
+	s.startTokenSweeper()
 	go func() {
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- err
@@ -215,15 +230,25 @@ func (s *Server) Handler() http.Handler { return s.r }
 // 目前只有补号调度器需要收尾:它可能在创建间隔里等待,
 // 不主动停会让进程退出时多等几秒。
 func (s *Server) Close() {
+	s.stopTokenSweeper()
 	if s.pool != nil {
 		s.pool.Close()
 	}
 }
 
 func (s *Server) register() {
+	// ===== 对外取件接口(公开,只认 URL 里的令牌) =====
+	// 路径刻意做成 /m 而不是 /api/...,与分发出去的链接格式保持一致;
+	// 它不属于任何管理员会话,自带限流与缓存。
+	s.r.GET("/m", s.handlePublicMail)
+	s.r.HEAD("/m", s.handlePublicMail)
+
 	api := s.r.Group("/api")
 	api.Use(apiCacheControlMiddleware())
 	{
+		// ===== 健康检查(公开,不含敏感信息) =====
+		api.GET("/healthz", s.handleHealthz)
+
 		// ===== 认证(公开) =====
 		api.POST("/auth/login", s.handleLogin)
 		api.GET("/auth/session", s.handleSession)
@@ -274,10 +299,24 @@ func (s *Server) register() {
 			authed.PATCH("/groups/:id", csrfCheck(s.auth), s.updateGroupHandler)
 			authed.DELETE("/groups/:id", csrfCheck(s.auth), s.deleteGroupHandler)
 
+			// ===== 标注(本系统自有的第二套标签) =====
+			authed.GET("/tags", s.listTagsHandler)
+			authed.POST("/tags", csrfCheck(s.auth), s.createTagHandler)
+			authed.PATCH("/tags/:id", csrfCheck(s.auth), s.updateTagHandler)
+			authed.DELETE("/tags/:id", csrfCheck(s.auth), s.deleteTagHandler)
+			authed.PUT("/alias-tags", csrfCheck(s.auth), s.setAliasTagsHandler)
+
 			// ===== 别名元数据(分组/备注) =====
 			authed.GET("/alias-meta", s.listAliasMetaHandler)
 			authed.PUT("/alias-meta", csrfCheck(s.auth), s.putAliasMetaHandler)
 			authed.DELETE("/alias-meta", csrfCheck(s.auth), s.deleteAliasMetaHandler)
+
+			// ===== 分发凭证:取件令牌(签发/撤销) =====
+			// 同样避开 /aliases/:id 的参数节点,单独挂在 /alias-token 下
+			authed.POST("/alias-token", csrfCheck(s.auth), s.issueAliasTokenHandler)
+			authed.DELETE("/alias-token", csrfCheck(s.auth), s.revokeAliasTokenHandler)
+			// 手动触发一次到期回收(后台每 10 分钟也会自动跑)
+			authed.POST("/alias-token/sweep", csrfCheck(s.auth), s.sweepTokensHandler)
 
 			// ===== 收信活动(最近一次收到邮件的时间) =====
 			authed.GET("/alias-activity", s.aliasActivityHandler)
@@ -285,12 +324,15 @@ func (s *Server) register() {
 
 			// ===== 别名池自动补号 =====
 			authed.GET("/pool", s.listPoolHandler)
+			authed.GET("/pool/:id/preview", s.previewPoolHandler)
 			authed.PUT("/pool/:id", csrfCheck(s.auth), s.updatePoolHandler)
 			authed.DELETE("/pool/:id", csrfCheck(s.auth), s.deletePoolHandler)
 			authed.POST("/pool/:id/run", csrfCheck(s.auth), s.runPoolHandler)
 
 			// ===== 系统 =====
 			authed.GET("/meta", s.handleMeta)
+			authed.GET("/settings", s.getSettingsHandler)
+			authed.PUT("/settings", csrfCheck(s.auth), s.updateSettingsHandler)
 			authed.POST("/reload", csrfCheck(s.auth), s.reloadConfigHandler)
 		}
 	}
@@ -346,6 +388,10 @@ func (s *Server) createAliasHandler(c *gin.Context) {
 		failCode(c, http.StatusBadRequest, "GROUP_NOT_FOUND", "分组不存在")
 		return
 	}
+	// 限流放在所有校验之后、真正建号之前:参数错的请求不该占额度
+	if !s.allowCreate(c, req.AccountID) {
+		return
+	}
 
 	result, err := s.be.CreateAlias(req.AccountID, req.Label)
 	if err != nil {
@@ -383,6 +429,12 @@ func (s *Server) listInboxHandler(c *gin.Context) {
 		failCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "参数缺失: account_id")
 		return
 	}
+	// 账号必须真实存在:否则任何字符串都会被当成"某个账号"转发给上游,
+	// 既掩盖了前端 bug,也让错误信息变成看不懂的上游报错。
+	if !s.accountExists(accountID) {
+		failCode(c, http.StatusNotFound, "ACCOUNT_NOT_FOUND", "账号不存在")
+		return
+	}
 	alias := strings.TrimSpace(c.Query("alias"))
 	limit, err := parseInboxInt(c.DefaultQuery("limit", "20"), 1, 100)
 	if err != nil {
@@ -393,6 +445,13 @@ func (s *Server) listInboxHandler(c *gin.Context) {
 	if err != nil {
 		failCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "参数错误: days 需为 1-90 的整数")
 		return
+	}
+	// 传了 alias 就必须确实属于这个账号:否则等于让调用方
+	// 用任意别名的地址去上游碰运气,拿到一个空结果还以为是"没收到信"。
+	if alias != "" {
+		if !s.aliasOwned(c, accountID, alias) {
+			return
+		}
 	}
 
 	result, err := s.be.ListInbox(InboxQuery{
@@ -553,7 +612,11 @@ func (s *Server) listAliasesHandler(c *gin.Context) {
 		failCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "参数缺失: account_id")
 		return
 	}
-	aliases, err := s.be.ListAliases(accountID)
+	if !s.accountExists(accountID) {
+		failCode(c, http.StatusNotFound, "ACCOUNT_NOT_FOUND", "账号不存在")
+		return
+	}
+	aliases, err := s.listAliasesFor(c, accountID)
 	if err != nil {
 		backendFail(c, err)
 		return
@@ -654,12 +717,15 @@ func (s *Server) reloadConfigHandler(c *gin.Context) {
 	ok(c, gin.H{"message": "配置已重新加载"})
 }
 
+// Version 是构建版本,由 -ldflags "-X icloud-hme/internal/server.Version=v1.2.3" 注入。
+// 没注入时保持 "dev",页面照常显示。
+var Version = "dev"
+
 // handleMeta 处理 GET /api/meta,返回不影响安全的运行模式信息。
-//
-// 前端据 demo 显示提示条,避免把演示数据当成真实别名操作。
 func (s *Server) handleMeta(c *gin.Context) {
 	ok(c, gin.H{
-		"demo":    s.cfg.Demo,
-		"version": "dev",
+		"version": Version,
+		// 前端据此拼"邮箱----API"分发串;反代部署时用 ICLOUD_HME_PUBLIC_BASE_URL 覆盖
+		"public_base_url": s.publicBaseURL(c),
 	})
 }

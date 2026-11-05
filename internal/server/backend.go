@@ -77,8 +77,28 @@ type ForwardResult struct {
 	Method    string           `json:"method"`
 }
 
-// AliasActivityScan 是对某账号收件箱的一次扫描结果。
+// AliasMail 是按别名取信返回的单封邮件(对外取件 API 的载荷)。
 //
+// 字段刻意做成"只跟这封信有关":没有 account_id、没有 anonymous_id、
+// 没有读取方式。取件链接的持有者不该从响应里推断出账号结构。
+type AliasMail struct {
+	ID      string `json:"id"`
+	From    string `json:"from"`
+	To      string `json:"to"`
+	Subject string `json:"subject"`
+	Date    string `json:"date"`
+	Preview string `json:"preview"`
+	Body    string `json:"body,omitempty"`
+}
+
+// AliasMailResult 是一次按别名取信的结果。
+type AliasMailResult struct {
+	Recipient string      `json:"recipient"`
+	Method    string      `json:"method"`
+	Messages  []AliasMail `json:"messages"`
+}
+
+// AliasActivityScan 是对某账号收件箱的一次扫描结果。//
 // Hits 的键是别名邮箱(小写),值是最近一次收到投递的时间。
 // 别名最终都转发到同一个 iCloud 收件箱,所以扫一遍 INBOX 就能覆盖全部别名。
 type AliasActivityScan struct {
@@ -111,6 +131,10 @@ type Backend interface {
 	DeleteMessage(string, string) error
 	FetchForForward(ForwardQuery) (ForwardResult, error)
 	MarkForwarded(string, string, []string, bool) (int, error)
+	// FetchAliasMails 按别名取最近 hours 小时内的邮件,可选带回正文。
+	// 这是对外取件接口(/m)的唯一数据来源:调用方已经通过令牌确认了身份,
+	// 因此这里不再做归属校验,但也只允许拿一个别名。
+	FetchAliasMails(accountID, alias string, hours, limit int, withBody bool) (AliasMailResult, error)
 	Reload() error
 }
 
@@ -118,12 +142,14 @@ type Backend interface {
 type managerBackend struct {
 	mgr     *account.Manager
 	forward *forward.Store // "已转发"标记,可为 nil(禁用去重)
-	// demo 非 nil 时,别名接口改走内存假数据,不触碰真实 iCloud 账号。
-	demo *demoStore
 
 	// aliasCache 缓存别名列表,用于转发接口的归属校验,避免每次轮询都打上游。
 	aliasMu    sync.Mutex
 	aliasCache map[string]aliasCacheEntry
+
+	// listAliasesFn 仅用于测试:非 nil 时代替真实的上游调用,
+	// 让缓存行为(命中/过期/失效)能被直接验证。
+	listAliasesFn func(accountID string) ([]hme.Alias, error)
 }
 
 // aliasCacheEntry 是一条别名列表缓存。
@@ -265,10 +291,6 @@ func (b *managerBackend) RemoveAccount(id string) (bool, error) {
 
 // CreateAlias 创建 HME 别名。
 func (b *managerBackend) CreateAlias(accountID, label string) (*hme.CreateResult, error) {
-	// 演示模式:在内存里造一条,不消耗真实 iCloud 的别名额度
-	if b.demo != nil {
-		return b.demo.create(label), nil
-	}
 	client, err := b.mgr.HMEClient(accountID, false)
 	if err != nil {
 		return nil, mapAccountErr(err)
@@ -284,9 +306,8 @@ func (b *managerBackend) CreateAlias(accountID, label string) (*hme.CreateResult
 
 // ListAliases 列出账号的 HME 别名。
 func (b *managerBackend) ListAliases(accountID string) ([]hme.Alias, error) {
-	// 演示模式:账号没配凭据也能看到完整列表,便于确认字段与交互
-	if b.demo != nil {
-		return b.demo.list(), nil
+	if b.listAliasesFn != nil {
+		return b.listAliasesFn(accountID)
 	}
 	client, err := b.mgr.HMEClient(accountID, false)
 	if err != nil {
@@ -302,9 +323,6 @@ func (b *managerBackend) ListAliases(accountID string) ([]hme.Alias, error) {
 
 // SetAliasActive 停用或激活别名。
 func (b *managerBackend) SetAliasActive(accountID, anonymousID string, active bool) (bool, error) {
-	if b.demo != nil {
-		return b.demo.setActive(anonymousID, active), nil
-	}
 	client, err := b.mgr.HMEClient(accountID, false)
 	if err != nil {
 		return false, mapAccountErr(err)
@@ -316,6 +334,11 @@ func (b *managerBackend) SetAliasActive(accountID, anonymousID string, active bo
 		success, err = client.DeactivateHME(anonymousID)
 	}
 	_ = b.mgr.SaveCookiesIfChanged(accountID, client.CookieSnapshot())
+	// 启用状态变了,缓存里的 Active 字段就是旧的:不清掉会让列表页/
+	// 补号统计继续按"启用中"计算,和真实状态打架。
+	if success {
+		b.invalidateAliasCache(accountID)
+	}
 	if err != nil {
 		msg := "操作失败"
 		if !active {
@@ -330,12 +353,6 @@ func (b *managerBackend) SetAliasActive(accountID, anonymousID string, active bo
 
 // DeleteAlias 删除别名。
 func (b *managerBackend) DeleteAlias(accountID, anonymousID string) error {
-	if b.demo != nil {
-		if !b.demo.remove(anonymousID) {
-			return &BackendError{Status: http.StatusNotFound, Code: "ALIAS_NOT_FOUND", Message: "别名不存在"}
-		}
-		return nil
-	}
 	client, err := b.mgr.HMEClient(accountID, false)
 	if err != nil {
 		return mapAccountErr(err)
@@ -370,14 +387,6 @@ func (b *managerBackend) ScanAliasActivity(accountID string, days, limit int) (A
 	}
 	hits := make(map[string]time.Time)
 	result := AliasActivityScan{AccountID: accountID, WindowDays: days, Hits: hits}
-
-	// 演示模式的别名是内存里造的,真实收件箱里当然没有它们
-	if b.demo != nil {
-		result.Method = "demo"
-		result.Scanned = len(aliases)
-		result.Hits = b.demo.activity(owners, days)
-		return result, nil
-	}
 
 	record := func(list []mail.DeliveryHit) {
 		result.Scanned = len(list)
@@ -662,6 +671,19 @@ func (b *managerBackend) assertAliasOwned(accountID, alias string) error {
 	return &BackendError{Status: http.StatusForbidden, Code: "ALIAS_NOT_FOUND", Message: "该别名不属于当前账号"}
 }
 
+// cachedAliasLister 是可选的"带缓存的别名列表"能力。
+//
+// 只有生产后端实现了它:测试里的 fake 没有,直接走 ListAliases。
+// 用可选接口而不是塞进 Backend,是为了不逼所有实现都背上缓存语义。
+type cachedAliasLister interface {
+	ListAliasesCached(accountID string) ([]hme.Alias, error)
+}
+
+// ListAliasesCached 是 cachedAliases 的导出形式,供 handler 走类型断言调用。
+func (b *managerBackend) ListAliasesCached(accountID string) ([]hme.Alias, error) {
+	return b.cachedAliases(accountID)
+}
+
 // aliasCacheTTL 是别名列表缓存时长。
 const aliasCacheTTL = 60 * time.Second
 
@@ -738,9 +760,96 @@ func (b *managerBackend) MarkForwarded(accountID, alias string, messageIDs []str
 	return len(ids), nil
 }
 
+// FetchAliasMails 按别名取最近 hours 小时内的邮件(IMAP 优先,Web API 回退)。
+//
+// 三条必须守住的事:
+//  1. 只返回投递到 alias 本人的邮件——服务端 TO 搜索 + 本地精确地址二次校验;
+//  2. 时间窗按"小时"精确过滤(IMAP 的 SINCE 只到天,所以先多取一天再筛);
+//  3. 正文抓取有上限,不能因为某个别名堆了几十封邮件就发几十次 FETCH。
+func (b *managerBackend) FetchAliasMails(accountID, alias string, hours, limit int, withBody bool) (AliasMailResult, error) {
+	accountID = strings.TrimSpace(accountID)
+	alias = strings.TrimSpace(alias)
+	if accountID == "" || alias == "" {
+		return AliasMailResult{}, &BackendError{Status: http.StatusBadRequest, Code: "VALIDATION_ERROR", Message: "account_id 与 alias 必填"}
+	}
+	if hours <= 0 {
+		hours = 24
+	}
+	if limit <= 0 {
+		limit = 20
+	}
+	// IMAP SINCE 只精确到"天",多取一天再用小时精确过滤
+	days := hours/24 + 2
+	cutoff := time.Now().Add(-time.Duration(hours) * time.Hour)
+
+	var out []AliasMail
+	method := ""
+
+	// 只保留窗口内、且确实发给该别名的邮件
+	collect := func(list []mail.Message, full func(string) (*mail.FullMessage, error)) {
+		bodies := 0
+		for _, m := range list {
+			if len(out) >= limit {
+				return
+			}
+			if !mail.RecipientMatches(m.To, alias) {
+				continue
+			}
+			if at := mail.ParseMessageDate(m.Date); !at.IsZero() && at.Before(cutoff) {
+				continue
+			}
+			item := AliasMail{
+				ID: m.ID, From: m.From, To: m.To,
+				Subject: m.Subject, Date: m.Date, Preview: m.Preview,
+			}
+			if withBody && full != nil && bodies < aliasMailMaxBodyFetches {
+				// 正文失败不影响这封信本身:至少还有 preview 可用
+				if fm, err := full(m.ID); err == nil && fm != nil {
+					item.Body = fm.Body
+					bodies++
+				}
+			}
+			out = append(out, item)
+		}
+	}
+
+	imapErr := b.mgr.WithMailClient(accountID, func(mc *mail.Client) error {
+		list, err := mc.FindByRecipient(alias, limit*aliasMailFetchFactor, days)
+		if err != nil {
+			return err
+		}
+		method = "imap"
+		collect(list, func(id string) (*mail.FullMessage, error) { return mc.GetFullByID(id) })
+		return nil
+	})
+	if imapErr == nil {
+		return AliasMailResult{Recipient: alias, Method: method, Messages: out}, nil
+	}
+
+	// IMAP 不可用(只配了 Cookie 的账号)时退回 Web API
+	wmc, err := b.mgr.WebMailClient(accountID)
+	if err != nil {
+		return AliasMailResult{}, &BackendError{Status: http.StatusBadRequest, Code: "VALIDATION_ERROR", Message: "无可用邮件客户端: 需要 App 专用密码或 Cookie"}
+	}
+	messages, err := wmc.FindByAlias(alias, limit*aliasMailFetchFactor)
+	if err != nil {
+		return AliasMailResult{}, &BackendError{Status: http.StatusBadGateway, Code: "UPSTREAM_FAILURE", Message: "读取邮件失败"}
+	}
+	out = out[:0]
+	method = "web_api"
+	collect(messages, wmc.GetFull)
+	return AliasMailResult{Recipient: alias, Method: method, Messages: out}, nil
+}
+
+// aliasMailFetchFactor 是多取几倍候选再过滤:窗口外/别人的邮件会被丢掉,
+// 只取 limit 封的话很容易筛完就不够了。
+const aliasMailFetchFactor = 3
+
+// aliasMailMaxBodyFetches 限制单次请求最多抓多少封正文。
+const aliasMailMaxBodyFetches = 10
+
 // Reload 重新加载配置。
-func (b *managerBackend) Reload() error {
-	if err := b.mgr.Reload(); err != nil {
+func (b *managerBackend) Reload() error {	if err := b.mgr.Reload(); err != nil {
 		return &BackendError{Status: http.StatusInternalServerError, Code: "INTERNAL_ERROR", Message: "重新加载配置失败"}
 	}
 	return nil
@@ -753,7 +862,13 @@ func mapAccountErr(err error) *BackendError {
 		return &BackendError{Status: http.StatusNotFound, Code: "ACCOUNT_NOT_FOUND", Message: "账号不存在"}
 	}
 	if strings.Contains(msg, "Cookie") && strings.Contains(msg, "未配置") {
-		return &BackendError{Status: http.StatusBadRequest, Code: "VALIDATION_ERROR", Message: "账号未配置 Cookie"}
+		// 明确告诉用户去哪儿补:这条错误几乎都是"账号还没配凭据"引起的,
+		// 只说"未配置 Cookie"会让人以为是系统出了问题。
+		return &BackendError{
+			Status:  http.StatusBadRequest,
+			Code:    "VALIDATION_ERROR",
+			Message: "账号未配置 Cookie：请到「账号」页给这个账号更新 Cookie",
+		}
 	}
 	return &BackendError{Status: http.StatusBadRequest, Code: "VALIDATION_ERROR", Message: msg}
 }

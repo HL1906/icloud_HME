@@ -657,6 +657,12 @@ describe('AliasesPage 批量操作', () => {
 describe('AliasesPage 收信活动', () => {
   const DAY = 24 * 60 * 60 * 1000
   const receivedAgo = (days: number) => new Date(Date.now() - days * DAY).toISOString()
+  /** 列表里的时间统一按 YYYY/MM/DD HH:mm 展示，这里算一份期望值。 */
+  const fmtDate = (iso: string) => {
+    const d = new Date(iso)
+    const p = (v: number) => String(v).padStart(2, '0')
+    return `${d.getFullYear()}/${p(d.getMonth() + 1)}/${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`
+  }
 
   function mockList(meta: Record<string, unknown>) {
     return [
@@ -675,17 +681,18 @@ describe('AliasesPage 收信活动', () => {
     server.resetHandlers()
   })
 
-  it('展示最近收信相对时间,并可按「从未收信」筛选', async () => {
+  it('展示最近收信的精确时间,并可按「从未收信」筛选', async () => {
+    const threeDaysAgo = receivedAgo(3)
     server.use(
       ...mockList({
-        'alpha@icloud.com': { email: 'alpha@icloud.com', last_received_at: receivedAgo(3) },
+        'alpha@icloud.com': { email: 'alpha@icloud.com', last_received_at: threeDaysAgo },
       }),
     )
     renderPage()
     await screen.findByText('alpha@icloud.com')
 
     const table = screen.getByRole('table')
-    expect(within(table).getByText('3 天前')).toBeInTheDocument()
+    expect(within(table).getByText(fmtDate(threeDaysAgo))).toBeInTheDocument()
     // beta 没有任何记录:显示"未记录"而不是"从未收信"
     expect(within(table).getByText('未记录')).toBeInTheDocument()
 
@@ -716,6 +723,7 @@ describe('AliasesPage 收信活动', () => {
   it('刷新收信:发出扫描请求并把结果写回列表', async () => {
     let scanBody: Record<string, unknown> | null = null
     let listCalls = 0
+    const yesterday = receivedAgo(1)
     server.use(
       http.get('/api/accounts', () => HttpResponse.json({ success: true, data: accounts })),
       http.get('/api/aliases', () => {
@@ -723,7 +731,7 @@ describe('AliasesPage 收信活动', () => {
         // 第一次没有收信记录,扫描后再拉才带上时间
         const meta =
           listCalls > 1
-            ? { 'alpha@icloud.com': { email: 'alpha@icloud.com', last_received_at: receivedAgo(1) } }
+            ? { 'alpha@icloud.com': { email: 'alpha@icloud.com', last_received_at: yesterday } }
             : {}
         return HttpResponse.json({
           success: true,
@@ -756,7 +764,7 @@ describe('AliasesPage 收信活动', () => {
 
     expect(await screen.findByText('已扫描 42 封邮件，更新 1 个')).toBeInTheDocument()
     expect(scanBody).toEqual({ account_id: 'acc_1' })
-    expect(await screen.findByText('昨天')).toBeInTheDocument()
+    expect(await screen.findByText(fmtDate(yesterday))).toBeInTheDocument()
     expect(listCalls).toBeGreaterThan(1)
   })
 
