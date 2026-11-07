@@ -587,6 +587,16 @@ label {
   color: var(--color-text);
 }
 
+/* 非表单控件的字段分组标题:语义上不能用 <label>(label 必须绑定控件),
+   用这个类保持与 label 一致的观感 */
+.form-group-label {
+  display: block;
+  margin-bottom: var(--space-1);
+  font-weight: 500;
+  font-size: var(--text-sm);
+  color: var(--color-text);
+}
+
 input,
 select,
 textarea {

@@ -128,7 +128,9 @@ export default function AliasEditDialog({
       </div>
 
       <div className="form-field">
-        <label>标注</label>
+        {/* 这是一组切换按钮的分组标题,不是某个表单控件的标签,
+            语义上不能用 <label>(label 必须绑定控件),用带样式的 span */}
+        <span className="form-group-label">标注</span>
         {tags.length === 0 ? (
           <span className="hint">
             还没有标注。iCloud 的标签建号后不能改，所以另有一套可编辑的标注，

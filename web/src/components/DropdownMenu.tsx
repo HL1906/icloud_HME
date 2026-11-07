@@ -4,6 +4,7 @@ import {
   useLayoutEffect,
   useRef,
   useState,
+  type KeyboardEvent as ReactKeyboardEvent,
   type MouseEvent as ReactMouseEvent,
   type ReactNode,
 } from 'react'
@@ -97,6 +98,16 @@ export default function DropdownMenu({ label, trigger, children, align = 'right'
     if ((e.target as HTMLElement).closest('button, a')) close()
   }
 
+  // 键盘可达性:子项(按钮/链接)的 Enter/Space 由浏览器转成原生 click
+  // 冒泡到容器,由上面的 onClick 统一关闭 —— 所以这里绝不能替子项关闭
+  // (keydown 阶段关闭会卸载菜单,keyup 后的 click 事件就丢了,子项动作失效)。
+  // 只处理直接落在容器自身上的按键(容器 tabIndex=-1,仅兜底防止 Space 滚动页面)。
+  const handleMenuKeyDown = (e: ReactKeyboardEvent<HTMLDivElement>) => {
+    if (e.target === e.currentTarget && (e.key === 'Enter' || e.key === ' ')) {
+      e.preventDefault()
+    }
+  }
+
   return (
     <>
       <button
@@ -118,6 +129,7 @@ export default function DropdownMenu({ label, trigger, children, align = 'right'
             role="menu"
             tabIndex={-1}
             onClick={handleMenuClick}
+            onKeyDown={handleMenuKeyDown}
             style={pos ? { top: pos.top, left: pos.left } : { top: -9999, left: -9999 }}
           >
             {children}
