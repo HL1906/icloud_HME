@@ -9,7 +9,7 @@ import (
 // TestPreviewPathologicalInputs 用构造的恶意正文验证预览处理不会退化。
 // 这些输入用于回归 ReDoS / O(n^2) 类问题。
 func TestPreviewPathologicalInputs(t *testing.T) {
-	if raceEnabled() {
+	if raceEnabled {
 		t.Skip("race 模式下放宽时间限制")
 	}
 	cases := []struct {
