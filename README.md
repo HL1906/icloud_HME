@@ -32,7 +32,7 @@
 
 #### 方式一：下载二进制发布版（推荐）
 
-从 [GitHub Releases](https://github.com/xiaozhou26/icloud-hme/releases) 下载对应平台的二进制文件：
+从 [GitHub Releases](https://github.com/HL1906/icloud_HME/releases) 下载对应平台的二进制文件：
 
 | 平台 | 文件 |
 |---|---|
@@ -53,7 +53,7 @@ chmod +x icloud-hme_linux_amd64
 
 ```bash
 # 拉取镜像
-docker pull ghcr.io/xiaozhou26/icloud-hme:latest
+docker pull ghcr.io/hl1906/icloud_hme:latest
 
 # 运行（将本机 data 目录挂载进去）
 docker run -d \
@@ -61,7 +61,7 @@ docker run -d \
   -p 8081:8081 \
   -v /path/to/data:/app/data \
   -e ICLOUD_HME_ADMIN_PASSWORD='change-this-before-running-2026' \
-  ghcr.io/xiaozhou26/icloud-hme:latest
+  ghcr.io/hl1906/icloud_hme:latest
 ```
 
 > ⚠️ 上面的密码仅为示例，**不可照抄**，请务必更换为至少 8 字符的强密码。
@@ -72,7 +72,7 @@ docker run -d \
 
 ```bash
 # 前置要求: Go 1.26+、Node.js 22.12+
-git clone https://github.com/xiaozhou26/icloud-hme.git
+git clone https://github.com/HL1906/icloud_HME.git
 cd icloud-hme
 
 # 一键构建（安装前端依赖 → 前端测试 → 前端构建 → Go 测试 → 编译）
@@ -767,7 +767,7 @@ GOOS=windows GOARCH=amd64 go build -o icloud-hme.exe .
 git tag v0.2.0 && git push origin --tags
 ```
 
-Actions 会自动构建多平台二进制、Docker 镜像（`ghcr.io/xiaozhou26/icloud-hme`）并创建 Release。
+Actions 会自动构建多平台二进制、Docker 镜像（`ghcr.io/hl1906/icloud_hme`）并创建 Release。
 
 ### 代码规范
 
@@ -802,7 +802,7 @@ A local management tool for Apple iCloud Hide My Email (HME) aliases, supporting
 
 #### Option 1: Binary (GitHub Releases)
 
-Download the latest binary from [GitHub Releases](https://github.com/xiaozhou26/icloud-hme/releases):
+Download the latest binary from [GitHub Releases](https://github.com/HL1906/icloud_HME/releases):
 
 | Platform | File |
 |---|---|
@@ -822,14 +822,14 @@ chmod +x icloud-hme_linux_amd64
 #### Option 2: Docker
 
 ```bash
-docker pull ghcr.io/xiaozhou26/icloud-hme:latest
+docker pull ghcr.io/hl1906/icloud_hme:latest
 
 docker run -d \
   --name icloud-hme \
   -p 8081:8081 \
   -v /path/to/data:/app/data \
   -e ICLOUD_HME_ADMIN_PASSWORD='change-this-before-running-2026' \
-  ghcr.io/xiaozhou26/icloud-hme:latest
+  ghcr.io/hl1906/icloud_hme:latest
 ```
 
 > The password above is only an example — do NOT copy it. Use a strong password with at least 8 characters.
@@ -837,7 +837,7 @@ docker run -d \
 #### Option 3: Build from source (Go 1.26+ and Node.js 22.12+)
 
 ```bash
-git clone https://github.com/xiaozhou26/icloud-hme.git
+git clone https://github.com/HL1906/icloud_HME.git
 cd icloud-hme
 
 # One-shot build (frontend deps → frontend test → frontend build → Go test → binary)
