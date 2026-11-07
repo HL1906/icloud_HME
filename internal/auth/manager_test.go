@@ -13,11 +13,16 @@ import (
 var fixedNow = time.Date(2026, 8, 5, 10, 0, 0, 0, time.UTC)
 
 // fixedRandom 确定性随机源(用于生成 session ID / CSRF / salt)。
+// 并发测试里多个 goroutine 会同时通过 Manager 调用 Read,
+// 所以内部状态必须加锁(-race 下不加锁会报数据竞争)。
 type fixedRandom struct {
+	mu  sync.Mutex
 	seq uint64
 }
 
 func (r *fixedRandom) Read(p []byte) (int, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	for i := range p {
 		r.seq++
 		p[i] = byte(r.seq >> (8 * (uint(i) % 8)))
