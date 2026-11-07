@@ -20,5 +20,10 @@ export default defineConfig({
     environment: 'jsdom',
     setupFiles: ['./src/test/setup.ts'],
     globals: true,
+    // 测试中的时间断言(如 AppShell 的「登录有效期至 10-23 09:40」)按东八区硬编码,
+    // 组件用本地时区格式化。固定测试进程时区,保证本地与 CI(UTC 环境)结果一致。
+    env: {
+      TZ: 'Asia/Shanghai',
+    },
   },
 })
